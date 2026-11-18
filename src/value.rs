@@ -120,10 +120,17 @@ pub fn range_len(start: i128, stop: i128, step: i128) -> usize {
     n.max(0) as usize
 }
 
-#[derive(Debug)]
+/// An open file, or whatever the host's [`Opener`](crate::Opener) returned
+/// for that path.
 pub struct FileHandle {
     pub path: PathBuf,
-    pub file: std::fs::File,
+    pub reader: crate::fs::Reader,
+}
+
+impl fmt::Debug for FileHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<file {}>", self.path.display())
+    }
 }
 
 /// The hashable subset of values, usable as dict keys and set elements.
@@ -195,10 +202,9 @@ impl Key {
 
 pub(crate) fn check_depth(ty: &Type) -> Result<()> {
     if ty.depth() >= MAX_TYPE_DEPTH {
-        Err(err!(
-            Limit,
-            "value nesting exceeds the maximum depth of {MAX_TYPE_DEPTH}"
-        ))
+        Err(crate::Error::limit(crate::LimitExceeded::NestingDepth(
+            MAX_TYPE_DEPTH,
+        )))
     } else {
         Ok(())
     }

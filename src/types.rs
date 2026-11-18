@@ -175,7 +175,7 @@ impl Type {
             }
             _ => return Err(format!("unknown type '{name}'")),
         };
-        ty.check_depth().map_err(|e| e.message)?;
+        ty.check_depth().map_err(|e| e.to_string())?;
         Ok(ty)
     }
 
@@ -211,10 +211,9 @@ impl Type {
 
     pub fn check_depth(&self) -> crate::Result<()> {
         if self.depth() > MAX_TYPE_DEPTH {
-            Err(crate::error::err!(
-                Limit,
-                "type nesting exceeds the maximum depth of {MAX_TYPE_DEPTH}"
-            ))
+            Err(crate::Error::limit(crate::LimitExceeded::NestingDepth(
+                MAX_TYPE_DEPTH,
+            )))
         } else {
             Ok(())
         }

@@ -2,7 +2,8 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use femtopython::{
-    Config, ErrorKind, InputStatus, Interpreter, LockKind, Type, Value, input_status,
+    Allowlist, Config, ErrorClass, ErrorKind, InputStatus, Interpreter, LockKind, Opener, Reader,
+    Type, Value, input_status,
 };
 
 fn run(src: &str) -> Value {
@@ -15,13 +16,13 @@ fn repr(src: &str) -> String {
     run(src).repr()
 }
 
-fn fails(src: &str) -> ErrorKind {
+fn fails(src: &str) -> ErrorClass {
     match Interpreter::new().run(src) {
         Ok(v) => panic!(
             "expected {:?} to fail, got {v:?}",
             &src[..src.len().min(80)]
         ),
-        Err(e) => e.kind,
+        Err(e) => e.class(),
     }
 }
 
@@ -67,10 +68,10 @@ fn annotated_declarations() {
         run("a: u64 = 18446744073709551615\na"),
         Value::U64(u64::MAX)
     );
-    assert_eq!(fails("a: u8 = 256"), ErrorKind::Overflow);
-    assert_eq!(fails("a: u8 = -1"), ErrorKind::Overflow);
-    assert_eq!(fails("a: u8 = 'x'"), ErrorKind::Type);
-    assert_eq!(fails("a = 9223372036854775808"), ErrorKind::Overflow);
+    assert_eq!(fails("a: u8 = 256"), ErrorClass::Overflow);
+    assert_eq!(fails("a: u8 = -1"), ErrorClass::Overflow);
+    assert_eq!(fails("a: u8 = 'x'"), ErrorClass::Type);
+    assert_eq!(fails("a = 9223372036854775808"), ErrorClass::Overflow);
 }
 
 #[test]
@@ -87,12 +88,12 @@ fn literals_adopt_context_type() {
 
 #[test]
 fn no_implicit_numeric_mixing() {
-    assert_eq!(fails("x: u8 = 1\ny: u16 = 2\nx + y"), ErrorKind::Type);
-    assert_eq!(fails("a = 1\nb = 2.0\na + b"), ErrorKind::Type);
-    assert_eq!(fails("a = 1\na == 1.0"), ErrorKind::Type);
+    assert_eq!(fails("x: u8 = 1\ny: u16 = 2\nx + y"), ErrorClass::Type);
+    assert_eq!(fails("a = 1\nb = 2.0\na + b"), ErrorClass::Type);
+    assert_eq!(fails("a = 1\na == 1.0"), ErrorClass::Type);
     // Two bare literals unify, preferring float: `2 * 3.5` is a calculator.
     assert_eq!(run("1 == 1.0"), Value::Bool(true));
-    assert_eq!(fails("'a' + 1"), ErrorKind::Type);
+    assert_eq!(fails("'a' + 1"), ErrorClass::Type);
 }
 
 #[test]
@@ -101,11 +102,11 @@ fn rust_integer_semantics() {
     assert_eq!(run("-7 / 2"), Value::I64(-3));
     assert_eq!(run("-7 % 3"), Value::I64(-1));
     assert_eq!(run("7.0 / 2.0"), Value::F64(3.5));
-    assert_eq!(fails("x: u8 = 255\nx + 1"), ErrorKind::Overflow);
-    assert_eq!(fails("x: u8 = 0\nx - 1"), ErrorKind::Overflow);
-    assert_eq!(fails("1 / 0"), ErrorKind::ZeroDivision);
-    assert_eq!(fails("x: u8 = 1\n-x"), ErrorKind::Type);
-    assert_eq!(fails("1 << 64"), ErrorKind::Overflow);
+    assert_eq!(fails("x: u8 = 255\nx + 1"), ErrorClass::Overflow);
+    assert_eq!(fails("x: u8 = 0\nx - 1"), ErrorClass::Overflow);
+    assert_eq!(fails("1 / 0"), ErrorClass::ZeroDivision);
+    assert_eq!(fails("x: u8 = 1\n-x"), ErrorClass::Type);
+    assert_eq!(fails("1 << 64"), ErrorClass::Overflow);
 }
 
 #[test]
@@ -120,8 +121,8 @@ fn floor_division_and_power() {
     assert_eq!(run("x: u8 = 2\nx ** 7"), Value::U8(128));
     assert_eq!(run("x = 2.0\nx ** 2"), Value::F64(4.0));
     assert_eq!(run("2 ** 0.5"), Value::F64(2f64.powf(0.5)));
-    assert_eq!(fails("x: u8 = 2\nx ** 8"), ErrorKind::Overflow);
-    assert_eq!(fails("2 ** -1"), ErrorKind::Value);
+    assert_eq!(fails("x: u8 = 2\nx ** 8"), ErrorClass::Overflow);
+    assert_eq!(fails("2 ** -1"), ErrorClass::Value);
 }
 
 #[test]
@@ -154,16 +155,16 @@ fn comparisons_and_logic() {
     assert_eq!(run("False or True"), Value::Bool(true));
     // Short-circuit: the right side would be a NameError.
     assert_eq!(run("False and undefined"), Value::Bool(false));
-    assert_eq!(fails("1 and True"), ErrorKind::Type);
-    assert_eq!(fails("not 0"), ErrorKind::Type);
-    assert_eq!(fails("1 < 2 < 3"), ErrorKind::Syntax);
+    assert_eq!(fails("1 and True"), ErrorClass::Type);
+    assert_eq!(fails("not 0"), ErrorClass::Type);
+    assert_eq!(fails("1 < 2 < 3"), ErrorClass::Syntax);
 }
 
 #[test]
 fn conditional_expression() {
     assert_eq!(run("1 if True else 2"), Value::I64(1));
     assert_eq!(run("x: u8 = 1 if False else 2\nx"), Value::U8(2));
-    assert_eq!(fails("1 if 1 else 2"), ErrorKind::Type);
+    assert_eq!(fails("1 if 1 else 2"), ErrorClass::Type);
 }
 
 #[test]
@@ -177,16 +178,16 @@ fn strings_and_bytes() {
     assert_eq!(run("len('héllo')"), Value::I64(5));
     assert_eq!(repr("list(map(lambda c: c, 'hé'))"), "['h', 'é']");
     assert_eq!(repr("list(b'hi')"), "[104, 105]");
-    assert_eq!(fails("'abc'[3]"), ErrorKind::Index);
+    assert_eq!(fails("'abc'[3]"), ErrorClass::Index);
 }
 
 #[test]
 fn lists() {
     assert_eq!(repr("a = [1, 2, 3]\na[0] = 10\na"), "[10, 2, 3]");
     assert_eq!(repr("a = [[1], [2]]\na[1][0] += 5\na"), "[[1], [7]]");
-    assert_eq!(fails("[1, 'a']"), ErrorKind::Type);
-    assert_eq!(fails("a = [1]\na[0] = 'x'"), ErrorKind::Type);
-    assert_eq!(fails("[1][5]"), ErrorKind::Index);
+    assert_eq!(fails("[1, 'a']"), ErrorClass::Type);
+    assert_eq!(fails("a = [1]\na[0] = 'x'"), ErrorClass::Type);
+    assert_eq!(fails("[1][5]"), ErrorClass::Index);
     // Value semantics: copying a list never aliases it.
     assert_eq!(repr("a = [1]\nb = a\nb[0] = 2\na"), "[1]");
 }
@@ -202,9 +203,9 @@ fn list_methods() {
     assert_eq!(repr("a = [[1]]\na[0].append(2)\na"), "[[1, 2]]");
     assert_eq!(repr("a = []\na.append('x')\na"), "['x']");
     assert_eq!(repr("a = [1]\na.extend(range(2, 4))\na"), "[1, 2, 3]");
-    assert_eq!(fails("a = [1]\na.append('x')"), ErrorKind::Type);
-    assert_eq!(fails("a = []\na.pop()"), ErrorKind::Index);
-    assert_eq!(fails("[1].append(2)"), ErrorKind::Type);
+    assert_eq!(fails("a = [1]\na.append('x')"), ErrorClass::Type);
+    assert_eq!(fails("a = []\na.pop()"), ErrorClass::Index);
+    assert_eq!(fails("[1].append(2)"), ErrorClass::Type);
     assert_eq!(run("len([1, 2])"), Value::I64(2));
     assert_eq!(run("2 in [1, 2]"), Value::Bool(true));
     assert_eq!(run("3 not in [1, 2]"), Value::Bool(true));
@@ -216,10 +217,10 @@ fn empty_collections() {
     assert_eq!(run("a: list[u8] = []\na == []"), Value::Bool(true));
     assert_eq!(repr("d: dict[str, int] = {}\nd['x'] = 1\nd"), "{'x': 1}");
     assert_eq!(repr("d = {}\nd['x'] = 1\nd"), "{'x': 1}");
-    assert_eq!(fails("d = {}\nd['x'] = 1\nd[2] = 1"), ErrorKind::Type);
+    assert_eq!(fails("d = {}\nd['x'] = 1\nd[2] = 1"), ErrorClass::Type);
     assert_eq!(
         fails("d: dict[str, u8] = {}\nd['x'] = 300"),
-        ErrorKind::Overflow
+        ErrorClass::Overflow
     );
 }
 
@@ -236,10 +237,10 @@ fn dicts() {
     assert_eq!(repr(&format!("{d}d.pop('a')\nd")), "{'b': 2}");
     assert_eq!(run(&format!("{d}'a' in d")), Value::Bool(true));
     assert_eq!(run(&format!("{d}len(d)")), Value::I64(2));
-    assert_eq!(fails(&format!("{d}d['z']")), ErrorKind::Key);
-    assert_eq!(fails(&format!("{d}d[1]")), ErrorKind::Type);
-    assert_eq!(fails("{'a': 1, 2: 1}"), ErrorKind::Type);
-    assert_eq!(fails("{1.5: 1}"), ErrorKind::Type);
+    assert_eq!(fails(&format!("{d}d['z']")), ErrorClass::Key);
+    assert_eq!(fails(&format!("{d}d[1]")), ErrorClass::Type);
+    assert_eq!(fails("{'a': 1, 2: 1}"), ErrorClass::Type);
+    assert_eq!(fails("{1.5: 1}"), ErrorClass::Type);
 }
 
 #[test]
@@ -269,7 +270,7 @@ fn dict_values_are_heterogeneous_like_json() {
     // An annotated value type stays strict.
     assert_eq!(
         fails("d: dict[str, int] = {'a': 1}\nd['b'] = 'two'"),
-        ErrorKind::Type
+        ErrorClass::Type
     );
     assert_eq!(
         run("d: dict[str, Any] = {'a': 1}\nd['b'] = 'two'\nd['b']"),
@@ -281,8 +282,8 @@ fn dict_values_are_heterogeneous_like_json() {
 fn sets() {
     assert_eq!(repr("{1, 2, 2, 3}"), "{1, 2, 3}");
     assert_eq!(run("{1, 2} == {2, 1}"), Value::Bool(true));
-    assert_eq!(fails("{1, 'a'}"), ErrorKind::Type);
-    assert_eq!(fails("{1.0}"), ErrorKind::Type);
+    assert_eq!(fails("{1, 'a'}"), ErrorClass::Type);
+    assert_eq!(fails("{1.0}"), ErrorClass::Type);
 }
 
 #[test]
@@ -302,8 +303,8 @@ fn set_operations() {
     );
     assert_eq!(repr("s: set[u8] = set()\ns.add(1)\ns"), "{1}");
     assert_eq!(repr("set([1, 1, 2])"), "{1, 2}");
-    assert_eq!(fails("s = {1}\ns.remove(2)"), ErrorKind::Key);
-    assert_eq!(fails("{1} | {'a'}"), ErrorKind::Type);
+    assert_eq!(fails("s = {1}\ns.remove(2)"), ErrorClass::Key);
+    assert_eq!(fails("{1} | {'a'}"), ErrorClass::Type);
 }
 
 #[test]
@@ -312,8 +313,8 @@ fn tuples() {
     assert_eq!(repr("(1,)"), "(1,)");
     assert_eq!(run("(1, 'a')[1]"), Value::from("a"));
     assert_eq!(repr("list(map(lambda x: x * 2, (1, 2)))"), "[2, 4]");
-    assert_eq!(fails("list(map(lambda x: x, (1, 'a')))"), ErrorKind::Type);
-    assert_eq!(fails("t = (1, 2)\nt[0] = 5"), ErrorKind::Type);
+    assert_eq!(fails("list(map(lambda x: x, (1, 'a')))"), ErrorClass::Type);
+    assert_eq!(fails("t = (1, 2)\nt[0] = 5"), ErrorClass::Type);
 }
 
 #[test]
@@ -328,8 +329,8 @@ fn optional() {
     assert_eq!(run("xs = [1, None]\nxs[1] = 2\nxs[1]"), Value::I64(2));
     assert_eq!(run("None == None"), Value::Bool(true));
     assert_eq!(run("x = 1\nx == None"), Value::Bool(false));
-    assert_eq!(fails("x: int = None"), ErrorKind::Type);
-    assert_eq!(fails("def f(x: int): pass\nf(None)"), ErrorKind::Type);
+    assert_eq!(fails("x: int = None"), ErrorClass::Type);
+    assert_eq!(fails("def f(x: int): pass\nf(None)"), ErrorClass::Type);
     assert_eq!(
         run(
             "def f(x: Optional[int]) -> int:\n    if x is None:\n        return 0\n    return x\nf(None) + f(4)"
@@ -348,7 +349,7 @@ best";
         Value::Bool(true)
     );
     // `is` is only for None checks.
-    assert_eq!(fails("1 is 1"), ErrorKind::Syntax);
+    assert_eq!(fails("1 is 1"), ErrorClass::Syntax);
 }
 
 #[test]
@@ -372,14 +373,14 @@ fn conversions() {
     assert_eq!(run("float('2.5')"), Value::F64(2.5));
     assert_eq!(run("str(b'hi')"), Value::from("hi"));
     assert_eq!(run("str(b'\\xff')"), Value::None);
-    assert_eq!(fails("x = 300\ny: u8 = u8(x)"), ErrorKind::Type);
+    assert_eq!(fails("x = 300\ny: u8 = u8(x)"), ErrorClass::Type);
     assert_eq!(
         run("x = 300\ny: Optional[u8] = u8(x)\ny is None"),
         Value::Bool(true)
     );
     // No conversion at all (no `as`).
-    assert_eq!(fails("int(2.5)"), ErrorKind::Type);
-    assert_eq!(fails("x = 5\nfloat(x)"), ErrorKind::Type);
+    assert_eq!(fails("int(2.5)"), ErrorClass::Type);
+    assert_eq!(fails("x = 5\nfloat(x)"), ErrorClass::Type);
 }
 
 // ------------------------------------------------------------ control flow
@@ -395,7 +396,7 @@ fn if_elif_else() {
         return 0
 [sign(5), sign(-5), sign(0)]";
     assert_eq!(repr(src), "[1, -1, 0]");
-    assert_eq!(fails("if 1:\n    pass"), ErrorKind::Type);
+    assert_eq!(fails("if 1:\n    pass"), ErrorClass::Type);
 }
 
 #[test]
@@ -429,9 +430,9 @@ fn for_loops() {
     assert_eq!(repr("list(range(5, 0, -2))"), "[5, 3, 1]");
     assert_eq!(repr("x: u8 = 3\nlist(range(x))"), "[0, 1, 2]");
     assert_eq!(repr("x: u8 = 1\nlist(range(x, 3))"), "[1, 2]");
-    assert_eq!(fails("for a, b in [1, 2]:\n    pass"), ErrorKind::Type);
-    assert_eq!(fails("break"), ErrorKind::Syntax);
-    assert_eq!(fails("def f():\n    continue"), ErrorKind::Syntax);
+    assert_eq!(fails("for a, b in [1, 2]:\n    pass"), ErrorClass::Type);
+    assert_eq!(fails("break"), ErrorClass::Syntax);
+    assert_eq!(fails("def f():\n    continue"), ErrorClass::Syntax);
 }
 
 #[test]
@@ -447,12 +448,12 @@ fn loops_are_bounded_by_the_step_limit() {
         ..Config::default()
     });
     assert_eq!(
-        i.run("while True:\n    pass").unwrap_err().kind,
-        ErrorKind::Limit
+        i.run("while True:\n    pass").unwrap_err().class(),
+        ErrorClass::Limit
     );
     assert_eq!(
-        i.run("list(range(100000))").unwrap_err().kind,
-        ErrorKind::Limit
+        i.run("list(range(100000))").unwrap_err().class(),
+        ErrorClass::Limit
     );
 }
 
@@ -468,8 +469,8 @@ fn interrupts_stop_a_running_script() {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     });
     assert_eq!(
-        i.run("while True:\n    pass").unwrap_err().kind,
-        ErrorKind::Interrupted
+        i.run("while True:\n    pass").unwrap_err().class(),
+        ErrorClass::Interrupted
     );
     t.join().unwrap();
 }
@@ -479,8 +480,8 @@ fn interrupts_stop_a_running_script() {
 #[test]
 fn blocks_scope_declarations() {
     // A declaration inside a block disappears after it.
-    assert_eq!(fails("if True:\n    y = 1\ny"), ErrorKind::Name);
-    assert_eq!(fails("for i in range(3):\n    pass\ni"), ErrorKind::Name);
+    assert_eq!(fails("if True:\n    y = 1\ny"), ErrorClass::Name);
+    assert_eq!(fails("for i in range(3):\n    pass\ni"), ErrorClass::Name);
     // But blocks read and write enclosing variables directly.
     assert_eq!(run("x = 1\nif True:\n    x = 2\nx"), Value::I64(2));
     assert_eq!(
@@ -493,7 +494,7 @@ fn blocks_scope_declarations() {
         Value::I64(1)
     );
     // Writes to an enclosing block's variable keep its type.
-    assert_eq!(fails("x = 1\nif True:\n    x = 'str'"), ErrorKind::Type);
+    assert_eq!(fails("x = 1\nif True:\n    x = 'str'"), ErrorClass::Type);
 }
 
 #[test]
@@ -521,7 +522,7 @@ fn functions_copy_used_outer_variables_at_declaration() {
     // Names defined after the function are not visible to it.
     assert_eq!(
         fails("def f(): return later\nlater = 1\nf()"),
-        ErrorKind::Name
+        ErrorClass::Name
     );
     // Declarations inside shadow.
     assert_eq!(
@@ -569,7 +570,7 @@ seen";
         run("x: rwlock[int] = 1\ndef f():\n    x = 5\nf()\nx"),
         Value::I64(5)
     );
-    assert_eq!(fails("x: rwlock[int] = 1\nx = 'a'"), ErrorKind::Type);
+    assert_eq!(fails("x: rwlock[int] = 1\nx = 'a'"), ErrorClass::Type);
 }
 
 #[test]
@@ -582,11 +583,11 @@ fn rlock_is_read_only_in_nested_functions() {
     let e = Interpreter::new()
         .run("x: rlock[int] = 1\ndef f():\n    x += 1")
         .unwrap_err();
-    assert_eq!(e.kind, ErrorKind::Permission);
-    assert!(e.message.contains("may only be read"), "{}", e.message);
+    assert_eq!(e.class(), ErrorClass::Permission);
+    assert!(e.to_string().contains("may only be read"), "{e}");
     assert_eq!(
         fails("x: rlock[list[int]] = []\ndef f():\n    x.append(1)"),
-        ErrorKind::Permission
+        ErrorClass::Permission
     );
     // Shadowing with an annotation is fine.
     assert_eq!(
@@ -605,15 +606,15 @@ log";
     assert_eq!(repr(src), "['hi']");
     assert_eq!(
         fails("x: wlock[int] = 1\ndef f(): return x"),
-        ErrorKind::Permission
+        ErrorClass::Permission
     );
     assert_eq!(
         fails("x: wlock[int] = 1\ndef f():\n    x += 1"),
-        ErrorKind::Permission
+        ErrorClass::Permission
     );
     assert_eq!(
         fails("x: wlock[list[int]] = [1]\ndef f():\n    x.pop()"),
-        ErrorKind::Permission
+        ErrorClass::Permission
     );
 }
 
@@ -621,7 +622,7 @@ log";
 fn lock_permissions_propagate_through_nesting_and_lambdas() {
     assert_eq!(
         fails("x: rlock[int] = 1\ndef f():\n    def g():\n        x += 1"),
-        ErrorKind::Permission
+        ErrorClass::Permission
     );
     assert_eq!(
         run("x: rwlock[int] = 1\ndef f():\n    def g():\n        x += 1\n    g()\nf()\nx"),
@@ -629,10 +630,10 @@ fn lock_permissions_propagate_through_nesting_and_lambdas() {
     );
     assert_eq!(
         fails("x: wlock[int] = 1\nf = lambda: x"),
-        ErrorKind::Permission
+        ErrorClass::Permission
     );
-    assert_eq!(fails("def f(x: rwlock[int]): pass"), ErrorKind::Syntax);
-    assert_eq!(fails("x: list[rwlock[int]] = []"), ErrorKind::Syntax);
+    assert_eq!(fails("def f(x: rwlock[int]): pass"), ErrorClass::Syntax);
+    assert_eq!(fails("x: list[rwlock[int]] = []"), ErrorClass::Syntax);
 }
 
 #[test]
@@ -642,20 +643,20 @@ fn lock_reference_cycles_are_rejected() {
 def is_even(n: int) -> bool:
     return True if n == 0 else fns['odd'](n - 1)
 fns['even'] = is_even";
-    assert_eq!(fails(src), ErrorKind::Value);
+    assert_eq!(fails(src), ErrorClass::Value);
     // Every way of writing a lock is checked.
     let f = "def f(): return x\n";
     assert_eq!(
         fails(&format!("x: rwlock[Any] = 0\n{f}x = f")),
-        ErrorKind::Value
+        ErrorClass::Value
     );
     assert_eq!(
         fails(&format!("x: rwlock[list[Callable]] = []\n{f}x.append(f)")),
-        ErrorKind::Value
+        ErrorClass::Value
     );
     assert_eq!(
         fails(&format!("x: rwlock[Any] = 0\n{f}x = [(1, map(f, []))]")),
-        ErrorKind::Value
+        ErrorClass::Value
     );
     // Indirectly, through another lock.
     let src = "a: rwlock[Any] = 0
@@ -664,7 +665,7 @@ def fa(): return a
 b = fa
 def fb(): return b
 a = fb";
-    assert_eq!(fails(src), ErrorKind::Value);
+    assert_eq!(fails(src), ErrorClass::Value);
     // The lock is unchanged after the rejected write.
     let mut i = Interpreter::new();
     assert!(i.run(&format!("x: rwlock[Any] = 0\n{f}x = f")).is_err());
@@ -728,8 +729,8 @@ fn host_shared_locks() {
     let f = i.share("f", LockKind::ReadWrite, Type::Any, 0i64).unwrap();
     i.run("def g(): return f").unwrap();
     assert_eq!(
-        f.set(i.get("g").unwrap()).unwrap_err().kind,
-        ErrorKind::Value
+        f.set(i.get("g").unwrap()).unwrap_err().class(),
+        ErrorClass::Value
     );
 }
 
@@ -737,11 +738,11 @@ fn host_shared_locks() {
 
 #[test]
 fn call_time_type_checks() {
-    assert_eq!(fails("def f(a: u8): pass\nf('x')"), ErrorKind::Type);
-    assert_eq!(fails("def f() -> int: return 'x'\nf()"), ErrorKind::Type);
-    assert_eq!(fails("def f() -> int: pass\nf()"), ErrorKind::Type);
-    assert_eq!(fails("def f(a): pass\nf()"), ErrorKind::Type);
-    assert_eq!(fails("x = 1\nx()"), ErrorKind::Type);
+    assert_eq!(fails("def f(a: u8): pass\nf('x')"), ErrorClass::Type);
+    assert_eq!(fails("def f() -> int: return 'x'\nf()"), ErrorClass::Type);
+    assert_eq!(fails("def f() -> int: pass\nf()"), ErrorClass::Type);
+    assert_eq!(fails("def f(a): pass\nf()"), ErrorClass::Type);
+    assert_eq!(fails("x = 1\nx()"), ErrorClass::Type);
     assert_eq!(run("def id(a): return a\nid('s')"), Value::from("s"));
 }
 
@@ -760,11 +761,11 @@ apply(inc, 1)";
     );
     assert_eq!(
         fails("def apply(f: Callable[[int], int]): pass\ndef g(s: str) -> int: return 1\napply(g)"),
-        ErrorKind::Type
+        ErrorClass::Type
     );
     assert_eq!(
         fails("def apply(f: Callable[[int], int]): pass\napply(lambda a, b: a)"),
-        ErrorKind::Type
+        ErrorClass::Type
     );
     assert_eq!(
         run("def apply(f: Callable): return f()\napply(lambda: 3)"),
@@ -788,8 +789,8 @@ area(3, 4.5)
 #[test]
 fn unbounded_recursion_is_an_error_not_a_crash() {
     let src = "def f(n): return f(n + 1)\nf(0)";
-    assert_eq!(fails(src), ErrorKind::Limit);
-    assert_eq!(fails("(lambda f: f(f))(lambda f: f(f))"), ErrorKind::Limit);
+    assert_eq!(fails(src), ErrorClass::Limit);
+    assert_eq!(fails("(lambda f: f(f))(lambda f: f(f))"), ErrorClass::Limit);
 }
 
 // ---------------------------------------------------------------- builtins
@@ -800,7 +801,7 @@ fn print_builtin() {
         output("print(1, 'a', [b'x'], 2.0, None)\nprint()"),
         "1 a [b'x'] 2.0 None\n\n"
     );
-    assert_eq!(fails("print(print)"), ErrorKind::Type);
+    assert_eq!(fails("print(print)"), ErrorClass::Type);
     assert_eq!(run("print()"), Value::None);
 }
 
@@ -825,8 +826,8 @@ fn map_is_lazy_and_reiterable() {
         run("def sq(x: int) -> int: return x * x\nr: list[int] = list(map(sq, []))\nr == []"),
         Value::Bool(true)
     );
-    assert_eq!(fails("map(1, [1])"), ErrorKind::Type);
-    assert_eq!(fails("len(map(str, [1]))"), ErrorKind::Type);
+    assert_eq!(fails("map(1, [1])"), ErrorClass::Type);
+    assert_eq!(fails("len(map(str, [1]))"), ErrorClass::Type);
     assert_eq!(
         repr("list(map(lambda x: x + 1, map(lambda x: x * 2, range(3))))"),
         "[1, 3, 5]"
@@ -840,8 +841,32 @@ fn range_builtin() {
     assert_eq!(run("len(range(10, 0, -3))"), Value::I64(4));
     assert_eq!(run("4 in range(0, 10, 2)"), Value::Bool(true));
     assert_eq!(run("5 in range(0, 10, 2)"), Value::Bool(false));
-    assert_eq!(fails("range(0, 10, 0)"), ErrorKind::Value);
-    assert_eq!(fails("x: u8 = 1\ny: i8 = 2\nrange(x, y)"), ErrorKind::Type);
+    assert_eq!(fails("range(0, 10, 0)"), ErrorClass::Value);
+    assert_eq!(fails("x: u8 = 1\ny: i8 = 2\nrange(x, y)"), ErrorClass::Type);
+}
+
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(name: &str) -> TempDir {
+        let p = std::env::temp_dir().join(format!("femtopython-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn with_opener(opener: Opener) -> Interpreter {
+    Interpreter::with_config(Config {
+        opener,
+        ..Config::default()
+    })
 }
 
 #[test]
@@ -850,42 +875,142 @@ fn paths_and_open() {
         repr("Path('a') / 'b'"),
         format!("Path('a{}b')", std::path::MAIN_SEPARATOR)
     );
-    assert_eq!(fails("open('/etc/hostname')"), ErrorKind::Permission);
+    // Denied by default.
+    assert_eq!(fails("open('/etc/hostname')"), ErrorClass::Permission);
 
-    let dir = std::env::temp_dir().join(format!("femtopython-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("f.txt"), "contents").unwrap();
-    let mut i = Interpreter::with_config(Config {
-        allow_fs: true,
-        ..Config::default()
-    });
-    i.set("dir", dir.clone());
+    let dir = TempDir::new("open");
+    std::fs::write(dir.0.join("f.txt"), "contents").unwrap();
+    let mut i = with_opener(Opener::filesystem());
+    i.set("dir", dir.0.clone());
     assert_eq!(
         i.run("open(dir / 'f.txt').read()").unwrap(),
         Value::from("contents")
     );
+    assert_eq!(
+        i.run("open(dir / 'missing').read()").unwrap_err().class(),
+        ErrorClass::Io
+    );
     // `.read()` gives bytes when the context wants bytes, without decoding.
-    std::fs::write(dir.join("bin"), [0xff, 0x00]).unwrap();
+    std::fs::write(dir.0.join("bin"), [0xff, 0x00]).unwrap();
     assert_eq!(
         i.run("b: bytes = open(dir / 'bin').read()\nb").unwrap(),
         Value::Bytes([0xff, 0x00].as_slice().into())
     );
     assert_eq!(
-        i.run("open(dir / 'bin').read()").unwrap_err().kind,
-        ErrorKind::Value
+        i.run("open(dir / 'bin').read()").unwrap_err().class(),
+        ErrorClass::Value
     );
     assert_eq!(
         i.run("def size(b: bytes) -> int: return len(b)\nsize(open(dir / 'bin').read())")
             .unwrap(),
         Value::I64(2)
     );
-    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn allowlisted_directories_confine_open() {
+    let root = TempDir::new("allow-dir");
+    let data = root.0.join("data");
+    std::fs::create_dir_all(data.join("sub")).unwrap();
+    std::fs::write(data.join("a.txt"), "a").unwrap();
+    std::fs::write(data.join("sub").join("b.txt"), "b").unwrap();
+    std::fs::write(root.0.join("secret.txt"), "secret").unwrap();
+
+    let mut i = with_opener(Opener::allowlist(Allowlist::new().dir(&data).unwrap()));
+    i.set("root", root.0.clone());
+    i.set("data", data.clone());
+    assert_eq!(
+        i.run("open(data / 'a.txt').read()").unwrap(),
+        Value::from("a")
+    );
+    assert_eq!(
+        i.run("open(data / 'sub' / 'b.txt').read()").unwrap(),
+        Value::from("b")
+    );
+    assert_eq!(
+        i.run("open(data / 'sub' / '..' / 'a.txt').read()").unwrap(),
+        Value::from("a")
+    );
+    // Outside the directory, directly or via `..`.
+    for escape in [
+        "open(root / 'secret.txt')",
+        "open(data / '..' / 'secret.txt')",
+        "open(data / 'sub' / '..' / '..' / 'secret.txt')",
+        "open('/etc/hostname')",
+    ] {
+        let e = i.run(escape).unwrap_err();
+        assert!(
+            matches!(e.class(), ErrorClass::Permission | ErrorClass::Io),
+            "{escape}: {e}"
+        );
+        assert!(!e.to_string().contains("secret\""), "{e}");
+    }
+    #[cfg(unix)]
+    {
+        // A symlink inside the directory pointing out of it doesn't escape.
+        std::os::unix::fs::symlink(root.0.join("secret.txt"), data.join("link")).unwrap();
+        assert!(i.run("open(data / 'link').read()").is_err());
+        std::os::unix::fs::symlink(&root.0, data.join("up")).unwrap();
+        assert!(i.run("open(data / 'up' / 'secret.txt').read()").is_err());
+    }
+}
+
+#[test]
+fn allowlisted_files_allow_exactly_that_file() {
+    let root = TempDir::new("allow-file");
+    std::fs::write(root.0.join("ok.json"), "[1]").unwrap();
+    std::fs::write(root.0.join("other.json"), "[2]").unwrap();
+    let ok = root.0.join("ok.json");
+    let mut i = with_opener(Opener::allowlist(Allowlist::new().file(&ok).unwrap()));
+    i.set("root", root.0.clone());
+    assert_eq!(
+        i.run("json.loads(open(root / 'ok.json').read())")
+            .unwrap()
+            .repr(),
+        "[1]"
+    );
+    assert_eq!(
+        i.run("open(root / 'other.json')").unwrap_err().class(),
+        ErrorClass::Permission
+    );
+    // Bad allowlist entries are reported to the host up front.
+    assert!(Allowlist::new().dir(root.0.join("nope")).is_err());
+}
+
+#[test]
+fn custom_openers_are_invisible_to_scripts() {
+    use std::collections::HashMap;
+    let files: HashMap<&str, &str> = [("config.json", r#"{"debug": true}"#)].into();
+    let opener = Opener::custom(move |p| {
+        let name = p.to_str().unwrap_or_default();
+        match files.get(name) {
+            Some(text) => Ok(Box::new(std::io::Cursor::new(text.as_bytes().to_vec())) as Reader),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such file",
+            )),
+        }
+    });
+    let mut i = with_opener(opener);
+    assert_eq!(
+        i.run("cfg = json.loads(open('config.json').read())\ncfg['debug']")
+            .unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        i.run("open(Path('config.json')).read()").unwrap(),
+        Value::from(r#"{"debug": true}"#)
+    );
+    let e = i.run("open('nope')").unwrap_err();
+    assert!(
+        matches!(&e.kind, ErrorKind::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
+    );
 }
 
 #[test]
 fn methods_must_be_called() {
-    assert_eq!(fails("{1: 2}.keys"), ErrorKind::Type);
-    assert_eq!(fails("x = 1\nx.append(2)"), ErrorKind::Type);
+    assert_eq!(fails("{1: 2}.keys"), ErrorClass::Type);
+    assert_eq!(fails("x = 1\nx.append(2)"), ErrorClass::Type);
 }
 
 // --------------------------------------------------------- syntax & limits
@@ -893,14 +1018,14 @@ fn methods_must_be_called() {
 #[test]
 fn unsupported_syntax_is_rejected_clearly() {
     let e = Interpreter::new().run("import os").unwrap_err();
-    assert_eq!(e.kind, ErrorKind::Syntax);
-    assert!(e.message.contains("not supported"), "{}", e.message);
-    assert_eq!(fails("x = 1, 2"), ErrorKind::Syntax);
-    assert_eq!(fails("x: nosuchtype = 1"), ErrorKind::Syntax);
-    assert_eq!(fails("x: set[float] = {}"), ErrorKind::Syntax);
+    assert_eq!(e.class(), ErrorClass::Syntax);
+    assert!(e.to_string().contains("not supported"), "{e}");
+    assert_eq!(fails("x = 1, 2"), ErrorClass::Syntax);
+    assert_eq!(fails("x: nosuchtype = 1"), ErrorClass::Syntax);
+    assert_eq!(fails("x: set[float] = {}"), ErrorClass::Syntax);
     assert_eq!(
         fails("while True:\n    pass\nelse:\n    pass"),
-        ErrorKind::Syntax
+        ErrorClass::Syntax
     );
 }
 
@@ -910,24 +1035,24 @@ fn deeply_nested_input_is_rejected() {
     let parens = format!("{}1{}", "(".repeat(10_000), ")".repeat(10_000));
     assert_eq!(run(&parens), Value::I64(1));
     let lists = format!("{}1{}", "[".repeat(10_000), "]".repeat(10_000));
-    assert_eq!(fails(&lists), ErrorKind::Limit);
+    assert_eq!(fails(&lists), ErrorClass::Limit);
     let negs = format!("{}1", "-".repeat(10_000));
-    assert_eq!(fails(&negs), ErrorKind::Limit);
+    assert_eq!(fails(&negs), ErrorClass::Limit);
     let long_chain = vec!["1"; 50_000].join(" + ");
-    assert_eq!(fails(&long_chain), ErrorKind::Limit);
+    assert_eq!(fails(&long_chain), ErrorClass::Limit);
     let deep_type = format!("x: {}int{} = 1", "list[".repeat(100), "]".repeat(100));
-    assert_eq!(fails(&deep_type), ErrorKind::Syntax);
+    assert_eq!(fails(&deep_type), ErrorClass::Syntax);
 }
 
 #[test]
 fn deeply_nested_values_are_rejected() {
     assert_eq!(
         fails("a: Any = 1\nfor i in range(100):\n    a = [a]"),
-        ErrorKind::Limit
+        ErrorClass::Limit
     );
     assert_eq!(
         fails("m: Any = map(str, [1])\nfor i in range(100):\n    m = map(str, m)"),
-        ErrorKind::Limit
+        ErrorClass::Limit
     );
 }
 
@@ -938,7 +1063,7 @@ fn string_growth_is_bounded() {
         ..Config::default()
     });
     let src = "s = 'xx'\nfor i in range(20):\n    s = s + s";
-    assert_eq!(i.run(src).unwrap_err().kind, ErrorKind::Limit);
+    assert_eq!(i.run(src).unwrap_err().class(), ErrorClass::Limit);
 }
 
 #[test]
@@ -979,7 +1104,9 @@ fn embedding_api() {
     i.set("x", 20i64);
     i.register_raw_fn("double", |args| match args {
         [Value::I64(n)] => Ok(Value::I64(n * 2)),
-        _ => Err(femtopython::Error::new(ErrorKind::Type, "double(int)")),
+        _ => Err(femtopython::Error::new(ErrorKind::Type(
+            "double(int)".into(),
+        ))),
     });
     i.run("def add(a: int, b: int) -> int: return a + b\ny = double(x) + 2")
         .unwrap();
@@ -1005,4 +1132,55 @@ fn interpreter_is_send() {
         .join()
         .unwrap();
     assert_eq!(v, Value::I64(42));
+}
+
+#[test]
+fn errors_are_structured() {
+    use femtopython::LimitExceeded;
+    let mut i = Interpreter::with_config(Config {
+        max_steps: Some(100),
+        ..Config::default()
+    });
+    let e = i.run("while True:\n    pass").unwrap_err();
+    assert!(
+        matches!(e.kind, ErrorKind::Limit(LimitExceeded::Steps(100))),
+        "{e:?}"
+    );
+    let e = Interpreter::new().run("nope + 1").unwrap_err();
+    assert!(
+        matches!(&e.kind, ErrorKind::Name(n) if n == "nope"),
+        "{e:?}"
+    );
+    assert_eq!(e.to_string(), "NameError: name 'nope' is not defined");
+    let e = Interpreter::new().run("1 // 0").unwrap_err();
+    assert!(matches!(e.kind, ErrorKind::ZeroDivision));
+    assert_eq!(e.class().name(), "ZeroDivisionError");
+    let e = Interpreter::new()
+        .run("def f(n): return f(n)\nf(1)")
+        .unwrap_err();
+    assert!(matches!(
+        e.kind,
+        ErrorKind::Limit(LimitExceeded::EvalDepth(_))
+    ));
+    // Errors work with `?` and `Box<dyn Error>`.
+    fn host() -> Result<(), Box<dyn std::error::Error>> {
+        Interpreter::new().run("1 + 'a'")?;
+        Ok(())
+    }
+    assert!(host().unwrap_err().to_string().starts_with("TypeError"));
+}
+
+#[test]
+fn range_inference_is_int_only() {
+    assert_eq!(repr("x: u8 = 1\nlist(range(x, 3))"), "[1, 2]");
+    assert_eq!(run("r: Iterable[u8] = range(3)\nlist(r)[0]"), Value::U8(0));
+    assert_eq!(
+        run("def f(r: Iterable[i8]) -> int: return len(r)\nf(range(-3, 3))"),
+        Value::I64(6)
+    );
+    assert_eq!(fails("range(1.5)"), ErrorClass::Type);
+    assert_eq!(fails("range(0, 2.5)"), ErrorClass::Type);
+    assert_eq!(fails("range('3')"), ErrorClass::Type);
+    assert_eq!(fails("x: u8 = 1\ny = 5\nrange(x, y)"), ErrorClass::Type);
+    assert_eq!(fails("x: u8 = 1\nrange(x, 300)"), ErrorClass::Overflow);
 }

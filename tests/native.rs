@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use femtopython::{Bytes, Error, ErrorKind, Interpreter, Value};
+use femtopython::{Bytes, Error, ErrorClass, ErrorKind, Interpreter, Value};
 
 fn interp() -> Interpreter {
     let mut i = Interpreter::new();
@@ -33,7 +33,7 @@ fn interp() -> Interpreter {
     });
     i.register_fn("total", |m: HashMap<String, i64>| m.values().sum::<i64>());
     i.register_fn("strict", |x: i64| -> Result<i64, Error> {
-        Err(Error::new(ErrorKind::Key, format!("no {x}")))
+        Err(Error::new(ErrorKind::Key(format!("no {x}"))))
     });
     i.register_fn("squares", |n: u32| {
         (0..n).map(|x| x * x).collect::<Vec<u32>>()
@@ -60,21 +60,21 @@ fn literal_arguments_adopt_rust_parameter_types() {
 
 #[test]
 fn argument_types_and_arity_are_checked() {
-    assert_eq!(fails("hypot('3', 4)").kind, ErrorKind::Type);
-    assert_eq!(fails("hypot(3)").kind, ErrorKind::Type);
-    assert_eq!(fails("x = 1\nadd_u8(x, 2)").kind, ErrorKind::Type);
-    assert_eq!(fails("add_u8(300, 1)").kind, ErrorKind::Overflow);
-    assert_eq!(fails("sum(['a'])").kind, ErrorKind::Type);
+    assert_eq!(fails("hypot('3', 4)").class(), ErrorClass::Type);
+    assert_eq!(fails("hypot(3)").class(), ErrorClass::Type);
+    assert_eq!(fails("x = 1\nadd_u8(x, 2)").class(), ErrorClass::Type);
+    assert_eq!(fails("add_u8(300, 1)").class(), ErrorClass::Overflow);
+    assert_eq!(fails("sum(['a'])").class(), ErrorClass::Type);
 }
 
 #[test]
 fn errors_from_rust_become_script_errors() {
     let e = fails("add_u8(200, 56)");
-    assert_eq!(
-        (e.kind, e.message.as_str()),
-        (ErrorKind::Value, "u8 overflow")
+    assert!(
+        matches!(&e.kind, ErrorKind::Value(m) if m == "u8 overflow"),
+        "{e}"
     );
-    assert_eq!(fails("strict(1)").kind, ErrorKind::Key);
+    assert_eq!(fails("strict(1)").class(), ErrorClass::Key);
     // Spans point at the call site.
     assert!(
         fails("a = 1\nstrict(1)")
@@ -121,4 +121,46 @@ fn options_map_to_optional() {
     assert_eq!(i.eval("or_zero(None)").unwrap(), Value::U8(0));
     assert_eq!(i.eval("or_zero(9)").unwrap(), Value::U8(9));
     assert!(i.eval("or_zero('x')").is_err());
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("sensor {0} is offline")]
+struct SensorOffline(u32);
+
+#[test]
+fn host_errors_reach_the_caller_unchanged() {
+    let mut i = Interpreter::new();
+    i.register_fn(
+        "read_sensor",
+        |id: u32| -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+            if id == 7 {
+                Err(Box::new(SensorOffline(id)))
+            } else {
+                Ok(1.5)
+            }
+        },
+    );
+    assert_eq!(i.eval("read_sensor(1)").unwrap(), Value::F64(1.5));
+    let src = "def avg():\n    return read_sensor(1) + read_sensor(7)\navg()";
+    let e = i.run(src).unwrap_err();
+    assert_eq!(e.class(), ErrorClass::Native);
+    let inner = e
+        .downcast_native::<SensorOffline>()
+        .expect("original error type");
+    assert_eq!(inner.0, 7);
+    // It's also the error's source(), and the span points at the call.
+    assert_eq!(
+        std::error::Error::source(&e).unwrap().to_string(),
+        "sensor 7 is offline"
+    );
+    assert!(e.render(src).starts_with("line 2"), "{}", e.render(src));
+    // `Error::native` wraps any error type explicitly.
+    i.register_fn(
+        "strict_sensor",
+        |id: u32| -> Result<f64, femtopython::Error> {
+            Err(femtopython::Error::native(SensorOffline(id)))
+        },
+    );
+    let e = i.eval("strict_sensor(3)").unwrap_err();
+    assert_eq!(e.downcast_native::<SensorOffline>().unwrap().0, 3);
 }

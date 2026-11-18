@@ -91,10 +91,9 @@ impl Parser<'_> {
 
     fn check_depth(&self, depth: usize) -> Result<()> {
         if depth > MAX_JSON_DEPTH {
-            Err(err!(
-                Limit,
-                "JSON nesting exceeds the maximum depth of {MAX_JSON_DEPTH}"
-            ))
+            Err(Error::limit(crate::LimitExceeded::NestingDepth(
+                MAX_TYPE_DEPTH,
+            )))
         } else {
             Ok(())
         }
@@ -283,7 +282,7 @@ pub fn dumps(v: &Value, max_len: usize) -> Result<String> {
 
 fn check_len(out: &str, max_len: usize) -> Result<()> {
     if out.len() > max_len {
-        Err(err!(Limit, "JSON output exceeds {max_len} bytes"))
+        Err(Error::limit(crate::LimitExceeded::Size(max_len)))
     } else {
         Ok(())
     }

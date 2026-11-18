@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::error::{Error, Span, err};
+use crate::error::{Error, Span};
 use crate::types::Type;
 
 /// Maximum nesting depth of a single expression.
@@ -147,11 +147,7 @@ impl Expr {
         kind.for_each_child(|c| child_depth = child_depth.max(c.depth));
         let depth = child_depth + 1;
         if depth > MAX_EXPR_DEPTH {
-            return Err(err!(
-                Limit,
-                "expression nesting exceeds the maximum depth of {MAX_EXPR_DEPTH}"
-            )
-            .at(span));
+            return Err(Error::limit(crate::LimitExceeded::ExprDepth(MAX_EXPR_DEPTH)).at(span));
         }
         Ok(Expr { kind, span, depth })
     }

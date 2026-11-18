@@ -1,4 +1,4 @@
-use femtopython::{ErrorKind, Interpreter, Value};
+use femtopython::{ErrorClass, Interpreter, Value};
 
 fn run(src: &str) -> Value {
     Interpreter::new()
@@ -6,10 +6,10 @@ fn run(src: &str) -> Value {
         .unwrap_or_else(|e| panic!("{}", e.render(src)))
 }
 
-fn fails(src: &str) -> ErrorKind {
+fn fails(src: &str) -> ErrorClass {
     match Interpreter::new().run(src) {
         Ok(v) => panic!("expected {src:?} to fail, got {v:?}"),
-        Err(e) => e.kind,
+        Err(e) => e.class(),
     }
 }
 
@@ -58,8 +58,8 @@ doc['users'][1]['id'] + 40"#;
 fn loads_bytes() {
     assert_eq!(run("json.loads(b'[1, 2]')").repr(), "[1, 2]");
     assert_eq!(run("json.loads(b'\"\\xc3\\xa9\"')"), Value::from("é"));
-    assert_eq!(fails("json.loads(b'\"\\xff\"')"), ErrorKind::Value);
-    assert_eq!(fails("json.loads(1)"), ErrorKind::Type);
+    assert_eq!(fails("json.loads(b'\"\\xff\"')"), ErrorClass::Value);
+    assert_eq!(fails("json.loads(1)"), ErrorClass::Type);
 }
 
 #[test]
@@ -85,19 +85,19 @@ fn loads_rejects_invalid_json() {
         "\"\t\"",
     ] {
         let src = format!("json.loads({bad:?})");
-        assert_eq!(fails(&src), ErrorKind::Value, "{bad:?} should be rejected");
+        assert_eq!(fails(&src), ErrorClass::Value, "{bad:?} should be rejected");
     }
     // Integers too large for int.
     assert_eq!(
         fails("json.loads('99999999999999999999')"),
-        ErrorKind::Value
+        ErrorClass::Value
     );
 }
 
 #[test]
 fn loads_bounds_nesting() {
     let deep = format!("json.loads('{}{}')", "[".repeat(10_000), "]".repeat(10_000));
-    assert_eq!(fails(&deep), ErrorKind::Limit);
+    assert_eq!(fails(&deep), ErrorClass::Limit);
 }
 
 #[test]
@@ -121,12 +121,12 @@ fn dumps_matches_python_formatting() {
 
 #[test]
 fn dumps_rejects_non_json_values() {
-    assert_eq!(fails("json.dumps({1, 2})"), ErrorKind::Type);
-    assert_eq!(fails("json.dumps(b'x')"), ErrorKind::Type);
-    assert_eq!(fails("json.dumps(print)"), ErrorKind::Type);
-    assert_eq!(fails("json.dumps(map(str, [1]))"), ErrorKind::Type);
-    assert_eq!(fails("x = 1.0 / 0.0\njson.dumps(x)"), ErrorKind::Value);
-    assert_eq!(fails("json.dumps({(1, 2): 1})"), ErrorKind::Type);
+    assert_eq!(fails("json.dumps({1, 2})"), ErrorClass::Type);
+    assert_eq!(fails("json.dumps(b'x')"), ErrorClass::Type);
+    assert_eq!(fails("json.dumps(print)"), ErrorClass::Type);
+    assert_eq!(fails("json.dumps(map(str, [1]))"), ErrorClass::Type);
+    assert_eq!(fails("x = 1.0 / 0.0\njson.dumps(x)"), ErrorClass::Value);
+    assert_eq!(fails("json.dumps({(1, 2): 1})"), ErrorClass::Type);
 }
 
 #[test]
@@ -166,6 +166,6 @@ fn json_functions_are_first_class() {
     );
     assert_eq!(run("f = json.dumps\nf(None)"), Value::from("null"));
     assert_eq!(run("json").repr(), "<module 'json'>");
-    assert_eq!(fails("json.nope('1')"), ErrorKind::Type);
-    assert_eq!(fails("json(1)"), ErrorKind::Type);
+    assert_eq!(fails("json.nope('1')"), ErrorClass::Type);
+    assert_eq!(fails("json(1)"), ErrorClass::Type);
 }

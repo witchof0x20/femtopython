@@ -19,7 +19,7 @@ pub(crate) fn mk(kind: ExprKind, l: usize, r: usize) -> Result<Expr, PErr> {
 
 pub(crate) fn user_err(msg: impl Into<String>, span: Span) -> PErr {
     ParseError::User {
-        error: Error::new(ErrorKind::Syntax, msg).at(span),
+        error: Error::new(ErrorKind::Syntax(msg.into())).at(span),
     }
 }
 
@@ -27,8 +27,7 @@ fn convert(e: PErr, src_len: usize) -> Error {
     match e {
         ParseError::User { error } => error,
         ParseError::UnrecognizedEof { location, .. } => {
-            Error::new(ErrorKind::IncompleteInput, "unexpected end of input")
-                .at((location, location))
+            Error::new(ErrorKind::IncompleteInput).at((location, location))
         }
         // The lexer closes open blocks with zero-width DEDENT tokens at the
         // end of input; tripping over one means a block body is missing
@@ -36,9 +35,7 @@ fn convert(e: PErr, src_len: usize) -> Error {
         ParseError::UnrecognizedToken {
             token: (l, Tok::Dedent, r),
             ..
-        } if l == r && r == src_len => {
-            Error::new(ErrorKind::IncompleteInput, "unexpected end of input").at((l, l))
-        }
+        } if l == r && r == src_len => Error::new(ErrorKind::IncompleteInput).at((l, l)),
         ParseError::UnrecognizedToken {
             token: (l, tok, r),
             expected,
@@ -47,13 +44,13 @@ fn convert(e: PErr, src_len: usize) -> Error {
             if !expected.is_empty() && expected.len() <= 6 {
                 msg.push_str(&format!(", expected one of {}", expected.join(" ")));
             }
-            Error::new(ErrorKind::Syntax, msg).at((l, r))
+            Error::new(ErrorKind::Syntax(msg)).at((l, r))
         }
         ParseError::ExtraToken { token: (l, tok, r) } => {
-            Error::new(ErrorKind::Syntax, format!("unexpected {tok}")).at((l, r))
+            Error::new(ErrorKind::Syntax(format!("unexpected {tok}"))).at((l, r))
         }
         ParseError::InvalidToken { location } => {
-            Error::new(ErrorKind::Syntax, "invalid token").at((location, location + 1))
+            Error::new(ErrorKind::Syntax("invalid token".into())).at((location, location + 1))
         }
     }
 }

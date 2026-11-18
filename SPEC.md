@@ -152,10 +152,10 @@ All operations should operate basically the same as their equivalent rust primit
 # Builtins outside of function types
 * print(varargs of anything that aren't a function) returns None always, but is typed `Optional[bool]`. varargs are not normally allowed, this function gets special treatment
 * map(f: T -> U, Iterator<Item=T>), returns a lazy `Iterable[U]`
-* range(stop), range(start, stop), range(start, stop, step), lazy. Args are all the same int type, and so are the elements
+* range(stop), range(start, stop), range(start, stop, step), lazy. Ints only. Args are all the same int type, and so are the elements. Literal args take their type from a non-literal arg (`range(x, 10)` with `x: u8` is u8), else from context (`r: Iterable[u8] = range(10)`), else int
 * len(x) for str (in chars), bytes, list, dict, set, tuple, and views with a known length
 * list(iterable), set(iterable), or empty with no args
-* open(filename: str|Path), read only. Off unless the host turns it on
+* open(filename: str|Path), read only. What it actually does is completely up to the host (see Embedding), the script can't tell the difference. Off unless the host turns it on
 * Path(str) (under the hood this should just be PathBuf basically and only really exist to be used for open and support / sugar)
 * the type names as conversion functions, see the top
 * `json.loads(s)`, s is str or bytes (utf-8). Returns `Any`
@@ -175,6 +175,23 @@ All operations should operate basically the same as their equivalent rust primit
 * `Interpreter` is `Send`. Native functions and the print output have to be `Send + Sync`
 * `input_status(src)` says whether input is complete, incomplete (keep reading) or invalid, for building a repl
 
+## open()
+The host decides what `open` does with an `Opener` in the config. The interpreter just calls it with the path and reads whatever `Read` it gets back.
+* `Opener::deny()`, the default. Always a PermissionError
+* `Opener::filesystem()`, regular file opens
+* `Opener::allowlist(Allowlist::new().dir(path)?.file(path)?)`, whitelisted paths only
+  * a dir entry allows anything beneath it. The dir is opened when it's added to the list and every open is resolved beneath that handle (cap-std), so `..` and symlinks can't get out of it, even if the filesystem changes later
+  * a file entry allows exactly that file name in its (also pinned) directory
+  * anything else is a PermissionError. Bad entries (missing dirs etc) are an error for the host when building the list, not later
+* `Opener::custom(f)`, anything else, e.g. serving files from memory. A `PermissionDenied` io error from it becomes a PermissionError in the script, anything else an IOError
+
+## Errors
+Everything that goes wrong comes back to the caller as an `Error`: an `ErrorKind` (thiserror enum) saying exactly what happened, plus the span. Scripts can't catch anything (no `try`), so an error always ends the run and goes to the host.
+* `ErrorKind` variants: `Syntax`, `IncompleteInput`, `Type`, `Name` (holds the name), `Value`, `Index`, `Key`, `ZeroDivision`, `Overflow`, `Io` (keeps the `io::Error` as its `source()`), `Permission`, `Limit` (which limit, as a `LimitExceeded`: `ExprDepth`, `NestingDepth`, `EvalDepth`, `Steps`, `Size`), `Interrupted`, `Native`
+* `Native` is an error returned by a host function, passed through untouched. `error.downcast_native::<MyError>()` gets the original back, and it's also the `source()`. Host functions get this by returning `Result<T, Box<dyn Error + Send + Sync>>` or using `Error::native(e)`. Returning a `String`/`&str` error is a ValueError, an `io::Error` is an IOError, and returning a `femtopython::Error` keeps its kind
+* `error.class()` gives the python-style exception class (`ErrorClass::Type` = TypeError etc) for coarse matching
+* `Display` is python-style: `TypeError: ...`. `error.render(src)` adds the line/col and a caret under the source
+
 ## Limits
 Everything has a limit so a script can't take the host down. All configurable.
 * filesystem off by default
@@ -190,6 +207,7 @@ Input is fully recognized before any of it runs: a regular lexer with a bounded 
 # Repl
 `femtopython` binary, behind the default-on `repl` feature.
 * `femtopython` for a `>>>` prompt, `femtopython file.py` to run a file, `-c code` to run code, `-i` to drop into the prompt after
-* `--allow-fs`, `--max-eval-depth`, `--max-steps`
+* `open` reads files normally, like python. `--no-fs` turns it off, `--allow-path PATH` (repeatable, file or dir) switches to the allowlist
+* `--max-eval-depth`, `--max-steps`
 * blocks need a blank line to finish, like python
 * echoes the value of expressions that aren't None

@@ -270,8 +270,9 @@ tuple!(A a, B b);
 tuple!(A a, B b, C c);
 tuple!(A a, B b, C c, D d);
 
-/// Errors a native function may return. `Error` keeps its kind; anything
-/// else becomes a `ValueError` carrying its message.
+/// Errors a native function may return. `Error` keeps its kind, strings
+/// become a `ValueError`, `io::Error` an `IOError`, and boxed errors pass
+/// through to the caller as `ErrorKind::Native`.
 pub trait IntoScriptError {
     fn into_script_error(self) -> Error;
 }
@@ -284,19 +285,28 @@ impl IntoScriptError for Error {
 
 impl IntoScriptError for String {
     fn into_script_error(self) -> Error {
-        Error::new(ErrorKind::Value, self)
+        Error::new(ErrorKind::Value(self))
     }
 }
 
 impl IntoScriptError for &str {
     fn into_script_error(self) -> Error {
-        Error::new(ErrorKind::Value, self)
+        Error::new(ErrorKind::Value(self.into()))
     }
 }
 
 impl IntoScriptError for std::io::Error {
     fn into_script_error(self) -> Error {
-        Error::new(ErrorKind::Io, self.to_string())
+        Error::io("I/O error in a native function", self)
+    }
+}
+
+/// Any other host error: aborts the script and reaches the caller as
+/// [`ErrorKind::Native`](crate::ErrorKind::Native), downcastable with
+/// [`Error::downcast_native`].
+impl IntoScriptError for Box<dyn std::error::Error + Send + Sync> {
+    fn into_script_error(self) -> Error {
+        Error::new(ErrorKind::Native(self.into()))
     }
 }
 

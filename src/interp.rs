@@ -24,7 +24,8 @@ use crate::ast::{
     BinOp, CmpOp, Expr, ExprKind, FreeVars, FuncDef, LambdaDef, LogicOp, READ_WRITE_METHODS, Stmt,
     StmtKind, UnOp, is_mutating_method, target_path,
 };
-use crate::error::{ErrorKind, Result, err};
+use crate::error::{Error, ErrorKind, LimitExceeded, Result, err};
+use crate::fs::Opener;
 use crate::native::{IntoNativeFn, NativeFn};
 use crate::ops;
 use crate::types::{FnSig, LockKind, MAX_TYPE_DEPTH, Type};
@@ -36,9 +37,9 @@ const STACK_SEGMENT: usize = 2 * 1024 * 1024;
 /// Host-controlled limits and capabilities.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Whether scripts may call `open`. Off by default: a script can only
-    /// touch the filesystem if the embedder opts in.
-    pub allow_fs: bool,
+    /// What `open()` does. Denied by default: a script can only read files
+    /// if the embedder provides an [`Opener`].
+    pub opener: Opener,
     /// Maximum evaluation nesting (expression depth plus call depth). Bounds
     /// recursion so runaway scripts error instead of exhausting memory.
     pub max_eval_depth: usize,
@@ -53,7 +54,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            allow_fs: false,
+            opener: Opener::deny(),
             max_eval_depth: 400,
             max_str_len: 16 * 1024 * 1024,
             max_steps: Some(10_000_000),
@@ -351,7 +352,7 @@ pub enum InputStatus {
 pub fn input_status(src: &str) -> InputStatus {
     match crate::parser::parse_program(src) {
         Ok(_) => InputStatus::Complete,
-        Err(e) if e.kind == ErrorKind::IncompleteInput => InputStatus::Incomplete,
+        Err(e) if matches!(e.kind, ErrorKind::IncompleteInput) => InputStatus::Incomplete,
         Err(_) => InputStatus::Invalid,
     }
 }
@@ -571,10 +572,10 @@ impl Interpreter {
         if let Some(max) = self.config.max_steps
             && self.steps > max
         {
-            return Err(err!(Limit, "step limit ({max}) exceeded"));
+            return Err(Error::limit(LimitExceeded::Steps(max)));
         }
         if self.interrupt.swap(false, AtomicOrdering::Relaxed) {
-            return Err(err!(Interrupted, "interrupted"));
+            return Err(Error::new(ErrorKind::Interrupted));
         }
         Ok(())
     }
@@ -782,7 +783,7 @@ impl Interpreter {
         let (scope_i, slot) = env
             .find(root)
             .map(|(i, s)| (i, s.clone()))
-            .ok_or_else(|| err!(Name, "name '{root}' is not defined").at(target.span))?;
+            .ok_or_else(|| Error::new(ErrorKind::Name(root.to_owned())).at(target.span))?;
         require_write(root, &slot, op.is_some()).map_err(|e| e.at(target.span))?;
         let root_ty = match &slot {
             Slot::Val(v, declared) => declared.clone().unwrap_or_else(|| v.type_of()),
@@ -832,11 +833,9 @@ impl Interpreter {
     fn eval_expr(&mut self, e: &Expr, env: &mut Env, hint: Option<&Type>) -> Result<Value> {
         self.depth += 1;
         let r = if self.depth > self.config.max_eval_depth {
-            Err(err!(
-                Limit,
-                "maximum evaluation depth ({}) exceeded; is there unbounded recursion?",
-                self.config.max_eval_depth
-            ))
+            Err(Error::limit(LimitExceeded::EvalDepth(
+                self.config.max_eval_depth,
+            )))
         } else {
             // Run on a fresh heap-allocated stack segment when the native
             // stack runs low, so `max_eval_depth` is the only limit and
@@ -1056,8 +1055,14 @@ impl Interpreter {
             self.eval_expr(callee, env, None)?
         };
         let vals = if matches!(f, Value::Builtin(Builtin::Range)) {
+            // Literal bounds take their type from a non-literal sibling, or
+            // from the context (`r: Iterable[u8] = range(10)`), else int.
             let refs: Vec<&Expr> = args.iter().collect();
-            self.eval_group(&refs, env, None)?
+            let elem = match hint {
+                Some(Type::Iterable(t)) if t.is_int() => Some(&**t),
+                _ => None,
+            };
+            self.eval_group(&refs, env, elem)?
         } else {
             let hints = param_hints(&f);
             let mut vals = Vec::with_capacity(args.len());
@@ -1067,7 +1072,7 @@ impl Interpreter {
                     // `u8(300)`: a literal that doesn't fit the target type
                     // stays an `int`, so the conversion yields `None`.
                     Err(e)
-                        if e.kind == ErrorKind::Overflow
+                        if matches!(e.kind, ErrorKind::Overflow(_))
                             && a.is_numeric_literal()
                             && matches!(f, Value::Builtin(Builtin::Convert(_))) =>
                     {
@@ -1243,7 +1248,7 @@ impl Interpreter {
                 self.out
                     .write_all(line.as_bytes())
                     .and_then(|_| self.out.flush())
-                    .map_err(|e| err!(Io, "print failed: {e}"))?;
+                    .map_err(|e| Error::io("print failed", e))?;
                 Ok(Value::None)
             }
             Builtin::Map => {
@@ -1267,10 +1272,7 @@ impl Interpreter {
                     cur = src;
                 }
                 if depth > MAX_TYPE_DEPTH {
-                    return Err(err!(
-                        Limit,
-                        "map() nesting exceeds the maximum depth of {MAX_TYPE_DEPTH}"
-                    ));
+                    return Err(Error::limit(LimitExceeded::NestingDepth(MAX_TYPE_DEPTH)));
                 }
                 let elem = ret_type_of(&f);
                 Ok(Value::Iter(Arc::new(IterView::Map { f, src, elem })))
@@ -1345,9 +1347,6 @@ impl Interpreter {
             }
             Builtin::Open => {
                 arity(1..=1)?;
-                if !self.config.allow_fs {
-                    return Err(err!(Permission, "filesystem access is disabled"));
-                }
                 let path = match &args[0] {
                     Value::Str(s) => std::path::PathBuf::from(&**s),
                     Value::Path(p) => (**p).clone(),
@@ -1359,9 +1358,20 @@ impl Interpreter {
                         ));
                     }
                 };
-                let file = std::fs::File::open(&path)
-                    .map_err(|e| err!(Io, "cannot open {}: {e}", path.display()))?;
-                Ok(Value::File(Arc::new(Mutex::new(FileHandle { path, file }))))
+                let reader = match self.config.opener.open(&path) {
+                    None => return Err(err!(Permission, "filesystem access is disabled")),
+                    Some(Ok(r)) => r,
+                    Some(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        return Err(err!(Permission, "cannot open {}: {e}", path.display()));
+                    }
+                    Some(Err(e)) => {
+                        return Err(Error::io(format!("cannot open {}", path.display()), e));
+                    }
+                };
+                Ok(Value::File(Arc::new(Mutex::new(FileHandle {
+                    path,
+                    reader,
+                }))))
             }
             Builtin::Convert(t) => {
                 arity(1..=1)?;
@@ -1433,12 +1443,12 @@ impl Interpreter {
                 let limit = self.config.max_str_len;
                 let mut buf = Vec::new();
                 let mut fh = f.lock().unwrap_or_else(|e| e.into_inner());
-                (&mut fh.file)
+                (&mut fh.reader)
                     .take(limit as u64 + 1)
                     .read_to_end(&mut buf)
-                    .map_err(|e| err!(Io, "read failed: {e}"))?;
+                    .map_err(|e| Error::io("read failed", e))?;
                 if buf.len() > limit {
-                    return Err(err!(Limit, "file is larger than {limit} bytes"));
+                    return Err(Error::limit(LimitExceeded::Size(limit)));
                 }
                 if wants_bytes(hint) {
                     return Ok(Value::Bytes(buf.into()));
@@ -1473,7 +1483,7 @@ impl Interpreter {
         let (scope_i, slot) = env
             .find(root)
             .map(|(i, s)| (i, s.clone()))
-            .ok_or_else(|| err!(Name, "name '{root}' is not defined").at(obj.span))?;
+            .ok_or_else(|| Error::new(ErrorKind::Name(root.to_owned())).at(obj.span))?;
         require_write(root, &slot, READ_WRITE_METHODS.contains(&method))
             .map_err(|e| e.at(obj.span))?;
         let place_ty = slot_type(
@@ -1596,7 +1606,7 @@ fn lookup(env: &Env, name: &str) -> Result<Value> {
         Some((_, slot)) => read_slot(name, slot),
         None => Builtin::lookup(name)
             .map(Value::Builtin)
-            .ok_or_else(|| err!(Name, "name '{name}' is not defined")),
+            .ok_or_else(|| Error::new(ErrorKind::Name(name.to_owned()))),
     }
 }
 

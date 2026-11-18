@@ -208,7 +208,7 @@ impl Lexer<'_> {
     }
 
     fn error(&self, start: usize, msg: impl Into<String>) -> Error {
-        Error::new(crate::ErrorKind::Syntax, msg).at((start, self.pos.max(start + 1)))
+        Error::new(crate::ErrorKind::Syntax(msg.into())).at((start, self.pos.max(start + 1)))
     }
 
     fn run(mut self) -> Result<Vec<Spanned>> {

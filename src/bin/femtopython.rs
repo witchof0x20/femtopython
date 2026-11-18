@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use femtopython::{Config, InputStatus, Interpreter, Value, input_status};
+use femtopython::{Allowlist, Config, InputStatus, Interpreter, Opener, Value, input_status};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -23,9 +23,14 @@ struct Args {
     #[arg(short = 'i')]
     interactive: bool,
 
-    /// Allow scripts to read files with open().
-    #[arg(long)]
-    allow_fs: bool,
+    /// Disable open() entirely.
+    #[arg(long, conflicts_with = "allow_path")]
+    no_fs: bool,
+
+    /// Only let open() read this file, or files beneath this directory.
+    /// Repeatable. Without it, open() reads any file, like Python.
+    #[arg(long, value_name = "PATH")]
+    allow_path: Vec<PathBuf>,
 
     /// Maximum evaluation nesting depth (expressions plus calls).
     #[arg(long, value_name = "N", default_value_t = Config::default().max_eval_depth)]
@@ -39,8 +44,15 @@ struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    let opener = match opener(&args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("femtopython: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let mut interp = Interpreter::with_config(Config {
-        allow_fs: args.allow_fs,
+        opener,
         max_eval_depth: args.max_eval_depth,
         max_steps: args.max_steps,
         ..Config::default()
@@ -85,6 +97,25 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn opener(args: &Args) -> std::io::Result<Opener> {
+    if args.no_fs {
+        return Ok(Opener::deny());
+    }
+    if args.allow_path.is_empty() {
+        return Ok(Opener::filesystem());
+    }
+    let mut list = Allowlist::new();
+    for p in &args.allow_path {
+        list = if p.is_dir() {
+            list.dir(p)
+        } else {
+            list.file(p)
+        }
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", p.display())))?;
+    }
+    Ok(Opener::allowlist(list))
 }
 
 /// Compound statements need a terminating blank line, as in CPython's REPL.

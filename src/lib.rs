@@ -8,6 +8,7 @@
 mod ast;
 mod check;
 pub mod error;
+pub mod fs;
 mod interp;
 mod json;
 mod lexer;
@@ -17,7 +18,8 @@ mod parser;
 pub mod types;
 pub mod value;
 
-pub use error::{Error, ErrorKind, Result};
+pub use error::{Error, ErrorClass, ErrorKind, LimitExceeded, Result};
+pub use fs::{Allowlist, Opener, Reader};
 pub use interp::{Builtin, Config, Function, InputStatus, Interpreter, Shared, input_status};
 pub use native::{Bytes, FromValue, IntoNativeFn, IntoValue, NativeFn};
 pub use types::{FnSig, LockKind, Type};

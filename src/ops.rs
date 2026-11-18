@@ -63,7 +63,7 @@ fn int_op<T: Int>(op: BinOp, a: T, b: T, ty: &Type) -> Result<T> {
         BinOp::Sub => a.c_sub(b).ok_or_else(overflow),
         BinOp::Mul => a.c_mul(b).ok_or_else(overflow),
         BinOp::Div | BinOp::Mod | BinOp::FloorDiv if b == T::ZERO => {
-            Err(err!(ZeroDivision, "division by zero"))
+            Err(Error::new(crate::ErrorKind::ZeroDivision))
         }
         BinOp::Div => a.c_div(b).ok_or_else(overflow),
         BinOp::Mod => a.c_rem(b).ok_or_else(overflow),
@@ -112,7 +112,7 @@ fn int_amount_op<T: Int>(op: BinOp, a: T, amount: &Value, ty: &Type) -> Result<T
 macro_rules! float_op {
     ($op:expr, $a:expr, $b:expr, $ty:expr) => {{
         let (a, b) = ($a, $b);
-        Ok(match $op {
+        Ok::<_, Error>(match $op {
             BinOp::Add => a + b,
             BinOp::Sub => a - b,
             BinOp::Mul => a * b,
@@ -190,10 +190,7 @@ pub fn binary(op: BinOp, a: &Value, b: &Value, max_len: usize) -> Result<Value> 
 
     let concat_limit = |len: usize| {
         if len > max_len {
-            Err(err!(
-                Limit,
-                "result of concatenation exceeds {max_len} bytes"
-            ))
+            Err(Error::limit(crate::LimitExceeded::Size(max_len)))
         } else {
             Ok(())
         }
@@ -547,14 +544,14 @@ pub fn conversion_type(to: &Type, from: &Type) -> Option<Type> {
 pub fn convert(to: &Type, v: &Value) -> Result<Value> {
     let from = v.type_of();
     if conversion_type(to, &from).is_none() {
-        let mut e = err!(Type, "no conversion from '{from}' to '{to}'");
-        if from.is_float() && to.is_int() {
-            e.message
-                .push_str(" (float to integer conversion is lossy and not supported)");
+        let why = if from.is_float() && to.is_int() {
+            " (float to integer conversion is lossy and not supported)"
         } else if from.is_int() && to.is_float() {
-            e.message.push_str(" (it would lose precision)");
-        }
-        return Err(e);
+            " (it would lose precision)"
+        } else {
+            ""
+        };
+        return Err(err!(Type, "no conversion from '{from}' to '{to}'{why}"));
     }
     if *to == from {
         return Ok(v.clone());
