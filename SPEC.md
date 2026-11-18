@@ -96,6 +96,7 @@ Like rust's integer literals. A literal number becomes whatever type the context
 * `x = v` where `x` is in the current scope: redeclaration. If it has an annotated type and `v` fits it, the annotation is kept. If not, it's a new variable with a new type
 * `x = v` where `x` is in an enclosing block of the same function: writes to it, no special treatment. The type has to stay compatible (otherwise annotate to shadow)
 * `x = v` where `x` doesn't exist: declares it
+* Same rule for locks and for plain variables: an annotation shadows for the rest of the scope it's in, including sub-blocks like an `if` body. Inside the shadow, `x = v` and `x += v` hit the shadow. Once the block ends the outer `x` (or lock) is back, untouched
 * for loop variables live in the loop body
 * Variables keep their annotated type, so `best: Optional[int] = None` then `best = x` in a loop works
 
@@ -109,7 +110,7 @@ Like rust's integer literals. A literal number becomes whatever type the context
   * `wlock[T]`: write only. Reading it is an error at declaration time (`.append()` etc is fine, `.pop()` and `+=` read)
 * "Declaration time" is when the `def`/`lambda` runs, before it's ever called. Nested functions keep the narrowest access
 * To get a local that shadows a lock, annotate it: `x: int = ...`
-* This is how you do mutual recursion between functions, since they can't see each other otherwise (store them in an `rwlock[dict[str, Callable]]`)
+* A lock can't end up holding a function that captures that same lock, directly or through other locks (e.g. `fns: rwlock[list[Callable]]` and appending a function that uses `fns`). That write is an error and the lock is left unchanged. Every other value is immutable or copy on write, so this is the only way to make a reference cycle, and this means everything always gets freed
 * The host can create these too and read/write them from rust while a script runs
 
 ## Functions
@@ -117,7 +118,7 @@ Still first class, as before.
 Type definitions not required, but calls are typechecked at call time (args against param types, return against return type).
 Declarations inside functions shadow.
 All variables outside a function are copied once, when the function is declared, and only the ones it actually uses. After that it never sees changes from outside, and writing to them only changes the function's copy. Locks are the exception, see above.
-A function can always call itself (recursion). Names declared after a function aren't visible to it.
+A function can always call itself (recursion). Names declared after a function aren't visible to it, so there's no mutual recursion between functions.
 `lambda a, b: expr`, same capture rules, no annotations.
 No default args, no keyword args, no varargs.
 

@@ -630,16 +630,80 @@ fn lock_permissions_propagate_through_nesting_and_lambdas() {
 }
 
 #[test]
-fn rwlock_enables_mutual_recursion() {
+fn lock_reference_cycles_are_rejected() {
+    // The mutual-recursion trick would close a cycle: fns -> is_even -> fns.
     let src = "fns: rwlock[dict[str, Callable]] = {}
 def is_even(n: int) -> bool:
     return True if n == 0 else fns['odd'](n - 1)
-def is_odd(n: int) -> bool:
-    return False if n == 0 else fns['even'](n - 1)
-fns['even'] = is_even
-fns['odd'] = is_odd
-is_even(10)";
-    assert_eq!(run(src), Value::Bool(true));
+fns['even'] = is_even";
+    assert_eq!(fails(src), ErrorKind::Value);
+    // Every way of writing a lock is checked.
+    let f = "def f(): return x\n";
+    assert_eq!(
+        fails(&format!("x: rwlock[Any] = 0\n{f}x = f")),
+        ErrorKind::Value
+    );
+    assert_eq!(
+        fails(&format!("x: rwlock[list[Callable]] = []\n{f}x.append(f)")),
+        ErrorKind::Value
+    );
+    assert_eq!(
+        fails(&format!("x: rwlock[Any] = 0\n{f}x = [(1, map(f, []))]")),
+        ErrorKind::Value
+    );
+    // Indirectly, through another lock.
+    let src = "a: rwlock[Any] = 0
+b: rwlock[Any] = 0
+def fa(): return a
+b = fa
+def fb(): return b
+a = fb";
+    assert_eq!(fails(src), ErrorKind::Value);
+    // The lock is unchanged after the rejected write.
+    let mut i = Interpreter::new();
+    assert!(i.run(&format!("x: rwlock[Any] = 0\n{f}x = f")).is_err());
+    assert_eq!(i.get("x"), Some(Value::I64(0)));
+    // Functions that don't capture the lock are fine.
+    assert_eq!(
+        run("fs: rwlock[list[Callable]] = []\ndef g(): return 1\nfs.append(g)\nfs[0]()"),
+        Value::I64(1)
+    );
+}
+
+#[test]
+fn annotations_shadow_for_the_rest_of_the_block() {
+    // Plain variables.
+    assert_eq!(
+        run("x = 1\nif True:\n    x: str = 'a'\n    x = 'b'\n    x += 'c'\nx"),
+        Value::I64(1)
+    );
+    assert_eq!(
+        repr("x = 1\nout = []\nfor i in range(2):\n    x: str = 'a'\n    out.append(x)\n(x, out)"),
+        "(1, ['a', 'a'])"
+    );
+    // Locks: a shadow in a sub-block hides the lock until the block ends.
+    assert_eq!(
+        run("c: rwlock[int] = 0\nif True:\n    c: int = 5\n    c += 1\n    c = 'now a str'\nc"),
+        Value::I64(0)
+    );
+    assert_eq!(
+        run("c: rwlock[int] = 0\nif True:\n    c += 1\nc"),
+        Value::I64(1)
+    );
+    // A shadowing lock in a sub-block is its own lock.
+    assert_eq!(
+        run(
+            "c: rwlock[int] = 0\nif True:\n    c: rwlock[int] = 10\n    def f():\n        c += 1\n    f()\nc"
+        ),
+        Value::I64(0)
+    );
+    // Inside a function, the same rules apply to captured variables.
+    assert_eq!(
+        run(
+            "x: rlock[int] = 1\ndef f():\n    if True:\n        x: int = 2\n        x += 1\n    return x\nf()"
+        ),
+        Value::I64(1)
+    );
 }
 
 #[test]
@@ -654,6 +718,13 @@ fn host_shared_locks() {
     total.set(100i64).unwrap();
     assert_eq!(i.eval("total").unwrap(), Value::I64(100));
     assert!(total.set("x").is_err());
+    // The host can't close a cycle either.
+    let f = i.share("f", LockKind::ReadWrite, Type::Any, 0i64).unwrap();
+    i.run("def g(): return f").unwrap();
+    assert_eq!(
+        f.set(i.get("g").unwrap()).unwrap_err().kind,
+        ErrorKind::Value
+    );
 }
 
 // --------------------------------------------------------------- functions

@@ -14,7 +14,7 @@
 //!   `rlock[T]`, `wlock[T]`), which are shared, with permissions checked
 //!   when the function is declared.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read as _, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -206,6 +206,7 @@ impl Shared {
             ));
         }
         v.refine(&self.0.ty);
+        check_no_cycle(&self.0, "shared lock", std::slice::from_ref(&v))?;
         *self.0.guard() = v;
         Ok(())
     }
@@ -721,6 +722,8 @@ impl Interpreter {
                             .map_err(|e| e.at(value.span))?;
                         let mut v = self.eval_expr(value, env, Some(&c.ty))?;
                         checked(&mut v, &c.ty)?;
+                        check_no_cycle(&c, name, std::slice::from_ref(&v))
+                            .map_err(|e| e.at(value.span))?;
                         *c.guard() = v;
                     }
                     Some((i, Slot::Val(old, declared))) => {
@@ -780,6 +783,9 @@ impl Interpreter {
             _ => Some(slot_type(&root_ty, &idxs)).filter(|t| *t != Type::Unknown),
         };
         let rhs = self.eval_expr(value, env, hint.as_ref())?;
+        if let Slot::Cell(c, _) = &slot {
+            check_no_cycle(c, root, std::slice::from_ref(&rhs)).map_err(|e| e.at(target.span))?;
+        }
         let max_len = self.config.max_str_len;
         let span = target.span;
         let apply = |v: &mut Value| -> Result<()> {
@@ -1430,6 +1436,9 @@ impl Interpreter {
             let items = self.collect(&vals[0])?;
             vals[0] = Value::new_list(Type::Unknown, items)?;
         }
+        if let Slot::Cell(c, _) = &slot {
+            check_no_cycle(c, root, &vals).map_err(|e| e.at(obj.span))?;
+        }
         let apply = |v: &mut Value| with_place(v, &idxs, |c| mutate(c, method, vals));
         match slot {
             Slot::Val(..) => {
@@ -1559,6 +1568,66 @@ fn capture(env: &Env, free: &FreeVars, fname: &str) -> Result<Arc<Vec<(String, S
         }
     }
     Ok(Arc::new(out))
+}
+
+/// Whether values of type `t` may contain functions (and so, through their
+/// captures, locks).
+fn may_hold_fn(t: &Type) -> bool {
+    match t {
+        Type::Function(_) | Type::Any | Type::Unknown | Type::Iterable(_) => true,
+        Type::List(e) | Type::Set(e) | Type::Optional(e) | Type::Lock(_, e) => may_hold_fn(e),
+        Type::Dict(_, v) => may_hold_fn(v),
+        Type::Tuple(ts) => ts.iter().any(may_hold_fn),
+        _ => false,
+    }
+}
+
+/// Refuse to store `vals` in `cell` if any of them can reach `cell` (through
+/// functions' captured locks). Every other value is immutable or
+/// copy-on-write, so a write into a lock is the only way a reference cycle
+/// could form; checking here keeps the value graph acyclic, so everything
+/// is freed by reference counting.
+fn check_no_cycle(cell: &Arc<Cell>, name: &str, vals: &[Value]) -> Result<()> {
+    let mut stack: Vec<Value> = vals
+        .iter()
+        .filter(|v| may_hold_fn(&v.type_of()))
+        .cloned()
+        .collect();
+    let mut seen_fns: HashSet<*const Function> = HashSet::new();
+    let mut seen_cells: HashSet<*const Cell> = HashSet::new();
+    while let Some(v) = stack.pop() {
+        match &v {
+            Value::List(l) if may_hold_fn(&l.elem) => stack.extend(l.items.iter().cloned()),
+            Value::Dict(d) if may_hold_fn(&d.val) => stack.extend(d.map.values().cloned()),
+            Value::Tuple(items) => stack.extend(items.iter().cloned()),
+            Value::Iter(view) => match &**view {
+                IterView::Map { f, src, .. } => stack.extend([f.clone(), src.clone()]),
+                IterView::Values(d) | IterView::Items(d) => stack.push(Value::Dict(d.clone())),
+                IterView::Range { .. } | IterView::Keys(_) => {}
+            },
+            Value::Function(f) if seen_fns.insert(Arc::as_ptr(f)) => {
+                for (_, slot) in f.captured.iter() {
+                    match slot {
+                        Slot::Val(v, _) => stack.push(v.clone()),
+                        Slot::Cell(c, _) if Arc::ptr_eq(c, cell) => {
+                            return Err(err!(
+                                Value,
+                                "storing function '{}' in '{name}' would create a reference \
+                                 cycle: it captures '{name}'",
+                                f.name
+                            ));
+                        }
+                        Slot::Cell(c, _) if seen_cells.insert(Arc::as_ptr(c)) => {
+                            stack.push(c.get())
+                        }
+                        Slot::Cell(..) => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn bind_targets(targets: &[String], item: Value) -> Result<Scope> {
