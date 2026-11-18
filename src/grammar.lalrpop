@@ -1,0 +1,257 @@
+// LR(1) grammar for femtopython. Tokens (including INDENT/DEDENT) come from
+// the hand-written lexer in lexer.rs.
+
+use std::rc::Rc;
+
+use crate::ast::*;
+use crate::error::Error;
+use crate::lexer::Tok;
+use crate::types::Type;
+
+use super::{mk, user_err};
+
+grammar;
+
+extern {
+    type Location = usize;
+    type Error = Error;
+
+    enum Tok {
+        "NEWLINE" => Tok::Newline,
+        "INDENT" => Tok::Indent,
+        "DEDENT" => Tok::Dedent,
+        "name" => Tok::Name(<String>),
+        "int" => Tok::Int(<u64>),
+        "float" => Tok::Float(<f64>),
+        "str" => Tok::Str(<Rc<str>>),
+        "bytes" => Tok::Bytes(<Rc<[u8]>>),
+        "def" => Tok::Def,
+        "return" => Tok::Return,
+        "lambda" => Tok::Lambda,
+        "and" => Tok::And,
+        "or" => Tok::Or,
+        "not" => Tok::Not,
+        "True" => Tok::True,
+        "False" => Tok::False,
+        "None" => Tok::None,
+        "pass" => Tok::Pass,
+        "(" => Tok::LParen,
+        ")" => Tok::RParen,
+        "[" => Tok::LBracket,
+        "]" => Tok::RBracket,
+        "{" => Tok::LBrace,
+        "}" => Tok::RBrace,
+        "," => Tok::Comma,
+        ":" => Tok::Colon,
+        "." => Tok::Dot,
+        "->" => Tok::Arrow,
+        "+" => Tok::Plus,
+        "-" => Tok::Minus,
+        "*" => Tok::Star,
+        "/" => Tok::Slash,
+        "%" => Tok::Percent,
+        "&" => Tok::Amp,
+        "|" => Tok::Pipe,
+        "^" => Tok::Caret,
+        "~" => Tok::Tilde,
+        "<<" => Tok::Shl,
+        ">>" => Tok::Shr,
+        "<" => Tok::Lt,
+        "<=" => Tok::Le,
+        "==" => Tok::EqEq,
+        "!=" => Tok::Ne,
+        ">=" => Tok::Ge,
+        ">" => Tok::Gt,
+        "=" => Tok::Assign,
+        "+=" => Tok::PlusEq,
+        "-=" => Tok::MinusEq,
+        "*=" => Tok::StarEq,
+        "%=" => Tok::PercentEq,
+    }
+}
+
+// ---------------------------------------------------------------- helpers
+
+Comma<T>: Vec<T> = {
+    <mut v:(<T> ",")*> <e:T?> => {
+        v.extend(e);
+        v
+    }
+};
+
+Comma1<T>: Vec<T> = {
+    <mut v:(<T> ",")*> <e:T> ","? => {
+        v.push(e);
+        v
+    }
+};
+
+// ------------------------------------------------------------- statements
+
+pub Program: Vec<Stmt> = Stmt*;
+
+/// A single expression, used by `Interpreter::eval`.
+pub SingleExpr: Expr = <Expr> "NEWLINE";
+
+Stmt: Stmt = {
+    <SimpleStmt> "NEWLINE",
+    FuncDef,
+};
+
+FuncDef: Stmt = {
+    <l:@L> "def" <name:"name"> "(" <params:Comma<Param>> ")" <ret:("->" <Type>)?> ":"
+        <body:Suite> <r:@R> =>
+        Stmt { kind: StmtKind::Def(Rc::new(FuncDef { name, params, ret, body })), span: (l, r) },
+};
+
+Param: Param = {
+    <l:@L> <name:"name"> <ty:(":" <Type>)?> <r:@R> => Param { name, ty, span: (l, r) },
+};
+
+Suite: Vec<Stmt> = {
+    <s:SimpleStmt> "NEWLINE" => vec![s],
+    "NEWLINE" "INDENT" <Stmt+> "DEDENT",
+};
+
+SimpleStmt: Stmt = {
+    <l:@L> <e:Expr> <r:@R> => Stmt { kind: StmtKind::Expr(e), span: (l, r) },
+    <l:@L> <target:Expr> "=" <value:Expr> <r:@R> =>? {
+        let kind = match target.kind {
+            ExprKind::Name(name) => StmtKind::Declare { name, ty: None, value },
+            ExprKind::Index(..) if target_path(&target).is_some() =>
+                StmtKind::Assign { target, value },
+            _ => return Err(user_err("cannot assign to this expression", target.span)),
+        };
+        Ok(Stmt { kind, span: (l, r) })
+    },
+    <l:@L> <name:"name"> ":" <ty:Type> "=" <value:Expr> <r:@R> =>
+        Stmt { kind: StmtKind::Declare { name, ty: Some(ty), value }, span: (l, r) },
+    <l:@L> <target:Expr> <op:AugOp> <value:Expr> <r:@R> =>? {
+        if target_path(&target).is_none() {
+            return Err(user_err("cannot assign to this expression", target.span));
+        }
+        Ok(Stmt { kind: StmtKind::AugAssign { target, op, value }, span: (l, r) })
+    },
+    <l:@L> "return" <e:Expr?> <r:@R> => Stmt { kind: StmtKind::Return(e), span: (l, r) },
+    <l:@L> "pass" <r:@R> => Stmt { kind: StmtKind::Pass, span: (l, r) },
+};
+
+AugOp: BinOp = {
+    "+=" => BinOp::Add,
+    "-=" => BinOp::Sub,
+    "*=" => BinOp::Mul,
+    "%=" => BinOp::Mod,
+};
+
+// ------------------------------------------------------------------ types
+
+Type: Type = {
+    <l:@L> <n:"name"> <r:@R> =>? Type::from_name(&n, vec![]).map_err(|m| user_err(m, (l, r))),
+    <l:@L> <n:"name"> "[" <args:Comma<Type>> "]" <r:@R> =>?
+        Type::from_name(&n, args).map_err(|m| user_err(m, (l, r))),
+    "None" => Type::None,
+};
+
+// ------------------------------------------------------------ expressions
+//
+// Precedence follows Python, except that comparisons do not chain
+// (`a < b < c` is a syntax error, as in Rust).
+
+Expr: Expr = {
+    <l:@L> "lambda" <params:Comma<"name">> ":" <body:Expr> <r:@R> =>?
+        mk(ExprKind::Lambda(Rc::new(LambdaDef { params, body })), l, r),
+    OrExpr,
+};
+
+OrExpr: Expr = {
+    <l:@L> <a:OrExpr> "or" <b:AndExpr> <r:@R> =>?
+        mk(ExprKind::Logic(LogicOp::Or, Box::new(a), Box::new(b)), l, r),
+    AndExpr,
+};
+
+AndExpr: Expr = {
+    <l:@L> <a:AndExpr> "and" <b:NotExpr> <r:@R> =>?
+        mk(ExprKind::Logic(LogicOp::And, Box::new(a), Box::new(b)), l, r),
+    NotExpr,
+};
+
+NotExpr: Expr = {
+    <l:@L> "not" <e:NotExpr> <r:@R> =>? mk(ExprKind::Unary(UnOp::Not, Box::new(e)), l, r),
+    Comparison,
+};
+
+Comparison: Expr = {
+    <l:@L> <a:BitOr> <op:CmpOp> <b:BitOr> <r:@R> =>?
+        mk(ExprKind::Compare(op, Box::new(a), Box::new(b)), l, r),
+    BitOr,
+};
+
+CmpOp: CmpOp = {
+    "<" => CmpOp::Lt,
+    "<=" => CmpOp::Le,
+    "==" => CmpOp::Eq,
+    "!=" => CmpOp::Ne,
+    ">=" => CmpOp::Ge,
+    ">" => CmpOp::Gt,
+};
+
+Tier<Op, Next>: Expr = {
+    <l:@L> <a:Tier<Op, Next>> <op:Op> <b:Next> <r:@R> =>?
+        mk(ExprKind::Binary(op, Box::new(a), Box::new(b)), l, r),
+    Next,
+};
+
+BitOr = Tier<BitOrOp, BitXor>;
+BitXor = Tier<BitXorOp, BitAnd>;
+BitAnd = Tier<BitAndOp, Shift>;
+Shift = Tier<ShiftOp, Arith>;
+Arith = Tier<ArithOp, Term>;
+Term = Tier<TermOp, Factor>;
+
+BitOrOp: BinOp = "|" => BinOp::BitOr;
+BitXorOp: BinOp = "^" => BinOp::BitXor;
+BitAndOp: BinOp = "&" => BinOp::BitAnd;
+ShiftOp: BinOp = { "<<" => BinOp::Shl, ">>" => BinOp::Shr };
+ArithOp: BinOp = { "+" => BinOp::Add, "-" => BinOp::Sub };
+TermOp: BinOp = { "*" => BinOp::Mul, "/" => BinOp::Div, "%" => BinOp::Mod };
+
+Factor: Expr = {
+    <l:@L> <op:UnaryOp> <e:Factor> <r:@R> =>? mk(ExprKind::Unary(op, Box::new(e)), l, r),
+    Primary,
+};
+
+UnaryOp: UnOp = { "-" => UnOp::Neg, "+" => UnOp::Pos, "~" => UnOp::Invert };
+
+Primary: Expr = {
+    <l:@L> <f:Primary> "(" <args:Comma<Expr>> ")" <r:@R> =>?
+        mk(ExprKind::Call(Box::new(f), args), l, r),
+    <l:@L> <base:Primary> "[" <idx:Expr> "]" <r:@R> =>?
+        mk(ExprKind::Index(Box::new(base), Box::new(idx)), l, r),
+    <l:@L> <base:Primary> "." <name:"name"> <r:@R> =>?
+        mk(ExprKind::Attr(Box::new(base), name), l, r),
+    Atom,
+};
+
+Atom: Expr = {
+    <l:@L> <v:"int"> <r:@R> =>? mk(ExprKind::Int(v), l, r),
+    <l:@L> <v:"float"> <r:@R> =>? mk(ExprKind::Float(v), l, r),
+    <l:@L> <v:"str"> <r:@R> =>? mk(ExprKind::Str(v), l, r),
+    <l:@L> <v:"bytes"> <r:@R> =>? mk(ExprKind::Bytes(v), l, r),
+    <l:@L> "True" <r:@R> =>? mk(ExprKind::Bool(true), l, r),
+    <l:@L> "False" <r:@R> =>? mk(ExprKind::Bool(false), l, r),
+    <l:@L> "None" <r:@R> =>? mk(ExprKind::None, l, r),
+    <l:@L> <n:"name"> <r:@R> =>? mk(ExprKind::Name(n), l, r),
+    "(" <Expr> ")",
+    <l:@L> "(" ")" <r:@R> =>? mk(ExprKind::Tuple(vec![]), l, r),
+    <l:@L> "(" <first:Expr> "," <rest:Comma<Expr>> ")" <r:@R> =>? {
+        let mut items = vec![first];
+        items.extend(rest);
+        mk(ExprKind::Tuple(items), l, r)
+    },
+    <l:@L> "[" <items:Comma<Expr>> "]" <r:@R> =>? mk(ExprKind::List(items), l, r),
+    <l:@L> "{" "}" <r:@R> =>? mk(ExprKind::Dict(vec![]), l, r),
+    <l:@L> "{" <items:Comma1<DictEntry>> "}" <r:@R> =>? mk(ExprKind::Dict(items), l, r),
+    <l:@L> "{" <items:Comma1<Expr>> "}" <r:@R> =>? mk(ExprKind::Set(items), l, r),
+};
+
+DictEntry: (Expr, Expr) = <k:Expr> ":" <v:Expr> => (k, v);
