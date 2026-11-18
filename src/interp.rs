@@ -9,6 +9,7 @@ use crate::ast::{
     BinOp, Expr, ExprKind, FuncDef, LambdaDef, LogicOp, Stmt, StmtKind, UnOp, target_path,
 };
 use crate::error::{ErrorKind, Result, err};
+use crate::native::{IntoNativeFn, NativeFn};
 use crate::ops;
 use crate::types::Type;
 use crate::value::{FileHandle, Key, Value};
@@ -62,20 +63,6 @@ enum Body {
 impl fmt::Debug for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "<function {}>", self.name)
-    }
-}
-
-type NativeFnImpl = dyn Fn(&[Value]) -> Result<Value>;
-
-/// A function provided by the host via [`Interpreter::register_fn`].
-pub struct NativeFn {
-    pub name: String,
-    func: Box<NativeFnImpl>,
-}
-
-impl fmt::Debug for NativeFn {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<native function {}>", self.name)
     }
 }
 
@@ -235,17 +222,33 @@ impl Interpreter {
         self.globals.iter().map(|(k, v)| (k.as_str(), v))
     }
 
-    /// Expose a host function to scripts as a global.
-    pub fn register_fn(
+    /// Expose a Rust function or closure to scripts as a global. Parameter
+    /// and return types are derived from its signature (see
+    /// [`IntoNativeFn`] for the supported types):
+    ///
+    /// ```
+    /// use femtopython::{Interpreter, Value};
+    ///
+    /// let mut interp = Interpreter::new();
+    /// interp.register_fn("hypot", |a: f64, b: f64| a.hypot(b));
+    /// assert_eq!(interp.eval("hypot(3, 4)").unwrap(), Value::F64(5.0));
+    /// assert!(interp.eval("hypot('3', 4)").is_err());
+    /// ```
+    pub fn register_fn<M>(&mut self, name: impl Into<String>, func: impl IntoNativeFn<M>) {
+        let name = name.into();
+        let f = func.into_native_fn(name.clone());
+        self.globals.insert(name, Value::Native(Rc::new(f)));
+    }
+
+    /// Expose an unchecked function that receives the raw argument values,
+    /// for variadic or dynamically-typed host functions.
+    pub fn register_raw_fn(
         &mut self,
         name: impl Into<String>,
         func: impl Fn(&[Value]) -> Result<Value> + 'static,
     ) {
         let name = name.into();
-        let f = NativeFn {
-            name: name.clone(),
-            func: Box::new(func),
-        };
+        let f = NativeFn::raw(name.clone(), func);
         self.globals.insert(name, Value::Native(Rc::new(f)));
     }
 
@@ -624,7 +627,7 @@ impl Interpreter {
         match f {
             Value::Function(func) => self.call_function(func, args),
             Value::Builtin(b) => self.call_builtin(b, args),
-            Value::Native(n) => (n.func)(&args),
+            Value::Native(n) => n.call(args),
             other => Err(err!(Type, "'{}' is not callable", other.type_of())),
         }
     }
@@ -737,6 +740,7 @@ impl Interpreter {
                     Value::Function(func) if out.is_empty() => {
                         func.ret.clone().unwrap_or(Type::Unknown)
                     }
+                    Value::Native(n) if out.is_empty() => n.ret().clone(),
                     _ => Type::Unknown,
                 };
                 Value::new_list(elem, out)
@@ -836,6 +840,12 @@ fn param_hints(f: &Value) -> Vec<Option<Type>> {
     match f {
         Value::Function(func) => func.params.iter().map(|(_, t)| t.clone()).collect(),
         Value::Builtin(Builtin::Convert(t)) => vec![Some(t.clone())],
+        Value::Native(n) => n
+            .params()
+            .unwrap_or_default()
+            .iter()
+            .map(|t| (*t != Type::Unknown).then(|| t.clone()))
+            .collect(),
         _ => vec![],
     }
 }

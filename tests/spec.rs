@@ -440,7 +440,7 @@ fn error_rendering_points_at_source() {
 fn embedding_api() {
     let mut i = Interpreter::new();
     i.set("x", 20i64);
-    i.register_fn("double", |args| match args {
+    i.register_raw_fn("double", |args| match args {
         [Value::I64(n)] => Ok(Value::I64(n * 2)),
         _ => Err(femtopython::Error::new(ErrorKind::Type, "double(int)")),
     });

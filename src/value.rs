@@ -13,7 +13,8 @@ use std::rc::Rc;
 use indexmap::{IndexMap, IndexSet};
 
 use crate::error::{Result, err};
-use crate::interp::{Builtin, Function, NativeFn};
+use crate::interp::{Builtin, Function};
+use crate::native::NativeFn;
 use crate::types::{MAX_TYPE_DEPTH, Type};
 
 #[derive(Clone)]

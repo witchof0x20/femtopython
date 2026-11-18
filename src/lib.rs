@@ -10,12 +10,14 @@ mod check;
 pub mod error;
 mod interp;
 mod lexer;
+pub mod native;
 mod ops;
 mod parser;
 pub mod types;
 pub mod value;
 
 pub use error::{Error, ErrorKind, Result};
-pub use interp::{Builtin, Config, Function, InputStatus, Interpreter, NativeFn, input_status};
+pub use interp::{Builtin, Config, Function, InputStatus, Interpreter, input_status};
+pub use native::{Bytes, FromValue, IntoNativeFn, IntoValue, NativeFn};
 pub use types::Type;
 pub use value::Value;
