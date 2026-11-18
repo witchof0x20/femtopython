@@ -325,6 +325,7 @@ dependencies = [
  "indexmap",
  "lalrpop",
  "lalrpop-util",
+ "libc",
  "rustyline",
  "stacker",
  "thiserror",

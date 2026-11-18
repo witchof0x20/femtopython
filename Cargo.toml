@@ -32,4 +32,5 @@ path = "src/bin/femtopython.rs"
 required-features = ["repl"]
 
 [dev-dependencies]
+libc = "0.2.191"
 thiserror = "2.0.21"

@@ -5,9 +5,13 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
-use femtopython::{Allowlist, Config, InputStatus, Interpreter, Opener, Value, input_status};
+use femtopython::{
+    Allowlist, Config, Error, ErrorKind, InputStatus, Interpreter, Killer, Opener, Value,
+    input_status,
+};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -40,7 +44,7 @@ struct Args {
     max_eval_depth: usize,
 
     /// Maximum number of steps per run (unlimited by default; Ctrl-C
-    /// interrupts a running script).
+    /// interrupts a running script, a second Ctrl-C exits).
     #[arg(long, value_name = "N")]
     max_steps: Option<u64>,
 }
@@ -54,20 +58,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut interp = Interpreter::with_config(Config {
+    let interp = Interpreter::with_config(Config {
         opener,
         max_eval_depth: args.max_eval_depth,
         max_steps: args.max_steps,
         ..Config::default()
     });
-    // Ctrl-C while a script runs interrupts it. (While reading input,
-    // rustyline sees Ctrl-C as a key press instead.)
-    let flag = interp.interrupt_handle();
-    if let Err(e) = ctrlc::set_handler(move || {
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-    }) {
-        eprintln!("femtopython: warning: cannot install Ctrl-C handler: {e}");
-    }
+    let mut runner = match Runner::new(interp) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("femtopython: cannot install Ctrl-C handler: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let script = match (&args.command, &args.file) {
         (Some(code), _) => Some(code.clone()),
@@ -82,10 +85,14 @@ fn main() -> ExitCode {
     };
 
     if let Some(src) = &script {
-        if let Err(e) = interp.run(src) {
-            eprintln!("{}", e.render(src));
+        if let Err(e) = runner.run(src) {
+            report(&e, src);
             if !args.interactive {
-                return ExitCode::FAILURE;
+                return match e.kind {
+                    // 128 + SIGINT, the shell convention for Ctrl-C.
+                    ErrorKind::Killed => ExitCode::from(130),
+                    _ => ExitCode::FAILURE,
+                };
             }
         }
         if !args.interactive {
@@ -93,12 +100,77 @@ fn main() -> ExitCode {
         }
     }
 
-    match repl(&mut interp) {
+    match repl(&mut runner) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("femtopython: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Runs each input on its own thread (`Interpreter::spawn`) so Ctrl-C can
+/// kill it at the next step and the prompt carries on with the globals the
+/// script left behind.
+struct Runner {
+    interp: Option<Interpreter>,
+    running: Arc<Mutex<Running>>,
+}
+
+/// The script currently running, shared with the Ctrl-C handler.
+#[derive(Default)]
+struct Running {
+    /// Kills the running script; `None` while waiting for input.
+    killer: Option<Killer>,
+    /// Ctrl-C was already pressed during this run.
+    kill_sent: bool,
+}
+
+impl Runner {
+    fn new(interp: Interpreter) -> Result<Runner, ctrlc::Error> {
+        let running: Arc<Mutex<Running>> = Arc::default();
+        let handler_running = running.clone();
+        ctrlc::set_handler(move || {
+            let mut r = handler_running.lock().unwrap_or_else(|e| e.into_inner());
+            let Running { killer, kill_sent } = &mut *r;
+            match killer {
+                // A second Ctrl-C while the first hasn't taken effect (e.g.
+                // the script is stuck inside a native function): give up.
+                Some(_) if *kill_sent => std::process::exit(130),
+                Some(k) => {
+                    *kill_sent = true;
+                    k.kill();
+                }
+                None => {}
+            }
+        })?;
+        Ok(Runner {
+            interp: Some(interp),
+            running,
+        })
+    }
+
+    fn set_running(&self, killer: Option<Killer>) {
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Running {
+            killer,
+            kill_sent: false,
+        };
+    }
+
+    fn run(&mut self, src: &str) -> Result<Value, Error> {
+        let handle = self.interp.take().expect("not running").spawn(src);
+        self.set_running(Some(handle.killer()));
+        let (interp, result) = handle.join();
+        self.set_running(None);
+        self.interp = Some(interp);
+        result
+    }
+}
+
+fn report(e: &Error, src: &str) {
+    match e.kind {
+        ErrorKind::Killed => eprintln!("KeyboardInterrupt"),
+        _ => eprintln!("{}", e.render(src)),
     }
 }
 
@@ -130,7 +202,7 @@ fn starts_block(src: &str) -> bool {
     })
 }
 
-fn repl(interp: &mut Interpreter) -> Result<(), ReadlineError> {
+fn repl(runner: &mut Runner) -> Result<(), ReadlineError> {
     let mut rl = DefaultEditor::new()?;
     println!("femtopython {} (Ctrl-D to exit)", env!("CARGO_PKG_VERSION"));
     'outer: loop {
@@ -159,10 +231,10 @@ fn repl(interp: &mut Interpreter) -> Result<(), ReadlineError> {
             prompt = "... ";
         }
         let _ = rl.add_history_entry(buf.trim_end());
-        match interp.run(&buf) {
+        match runner.run(&buf) {
             Ok(Value::None) => {}
             Ok(v) => println!("{}", v.repr()),
-            Err(e) => eprintln!("{}", e.render(&buf)),
+            Err(e) => report(&e, &buf),
         }
     }
 }

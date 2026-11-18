@@ -403,6 +403,17 @@ pub struct Interpreter {
     depth: usize,
     steps: u64,
     interrupt: Arc<AtomicBool>,
+    hook: Option<Box<StepHook>>,
+}
+
+type StepHook = dyn FnMut() -> StepControl + Send;
+
+/// What a step hook tells the interpreter to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepControl {
+    Continue,
+    /// Abort the script with [`ErrorKind::Killed`].
+    Stop,
 }
 
 const _: () = {
@@ -429,6 +440,7 @@ impl Interpreter {
             depth: 0,
             steps: 0,
             interrupt: Arc::new(AtomicBool::new(false)),
+            hook: None,
         }
     }
 
@@ -488,10 +500,12 @@ impl Interpreter {
 
     fn with_globals<R>(&mut self, f: impl FnOnce(&mut Self, &mut Env) -> Result<R>) -> Result<R> {
         let mut env = Env::new(std::mem::take(&mut self.globals));
-        let r = f(self, &mut env);
+        // Restore the globals even if a host function panics, so a caller
+        // that catches the panic gets a usable interpreter back.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, &mut env)));
         env.scopes.truncate(1);
         self.globals = env.scopes.pop().expect("base scope");
-        r
+        r.unwrap_or_else(|p| std::panic::resume_unwind(p))
     }
 
     /// Read a global variable (including lock variables).
@@ -580,7 +594,24 @@ impl Interpreter {
         if self.interrupt.swap(false, AtomicOrdering::Relaxed) {
             return Err(Error::new(ErrorKind::Interrupted));
         }
+        if let Some(hook) = &mut self.hook
+            && hook() == StepControl::Stop
+        {
+            return Err(Error::new(ErrorKind::Killed));
+        }
         Ok(())
+    }
+
+    /// Call `hook` before every step (statement, loop iteration and
+    /// iterator item). It may block, e.g. to pause the script, and returning
+    /// [`StepControl::Stop`] aborts the script with [`ErrorKind::Killed`].
+    /// [`spawn`](Self::spawn) builds pause/step/kill controls on top of this.
+    pub fn set_step_hook(&mut self, hook: impl FnMut() -> StepControl + Send + 'static) {
+        self.hook = Some(Box::new(hook));
+    }
+
+    pub fn clear_step_hook(&mut self) {
+        self.hook = None;
     }
 
     // ------------------------------------------------------------ statements

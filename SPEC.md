@@ -175,6 +175,16 @@ All operations should operate basically the same as their equivalent rust primit
 * `Interpreter` is `Send`. Native functions and the print output have to be `Send + Sync`
 * `input_status(src)` says whether input is complete, incomplete (keep reading) or invalid, for building a repl
 
+## Running on a thread / killing
+* `interp.spawn(src)` runs a script on its own thread and gives back a `ScriptHandle`. `spawn_paused(src)` starts it paused, `spawn_with(paused, |i| ...)` runs anything (e.g. `i.call(f, args)`)
+* `handle.kill()` (or a `Killer` from `handle.killer()`, cloneable, usable from any thread) stops it at its next step, running or paused. It finishes with `ErrorKind::Killed`
+* `handle.step(n)` runs exactly n more steps then pauses, `pause()`, `resume()`. These block until the script has actually paused (or finished)
+* `handle.join()` waits and gives back `(Interpreter, Result<Value>)`. The globals are whatever the script left, even after an error or a kill
+* dropping the handle without joining kills the script, so nothing can keep running in the background by accident
+* a panic in a host function is caught and comes back as `ErrorKind::Panic` instead of taking the thread down
+* the one thing that can't be killed promptly is a host function that blocks: the kill lands when it returns
+* under the hood this is a step hook, `interp.set_step_hook(|| StepControl::Continue | Stop)`, called before every step, which can block or stop the script. Hosts can use it directly
+
 ## open()
 The host decides what `open` does with an `Opener` in the config. The interpreter just calls it with the path and reads whatever `Read` it gets back.
 * `Opener::deny()`, the default. Always a PermissionError
@@ -187,7 +197,7 @@ The host decides what `open` does with an `Opener` in the config. The interprete
 
 ## Errors
 Everything that goes wrong comes back to the caller as an `Error`: an `ErrorKind` (thiserror enum) saying exactly what happened, plus the span. Scripts can't catch anything (no `try`), so an error always ends the run and goes to the host.
-* `ErrorKind` variants: `Syntax`, `IncompleteInput`, `Type`, `Name` (holds the name), `Value`, `Index`, `Key`, `ZeroDivision`, `Overflow`, `Io` (keeps the `io::Error` as its `source()`), `Permission`, `Limit` (which limit, as a `LimitExceeded`: `ExprDepth`, `NestingDepth`, `EvalDepth`, `Steps`, `Size`), `Interrupted`, `Native`
+* `ErrorKind` variants: `Syntax`, `IncompleteInput`, `Type`, `Name` (holds the name), `Value`, `Index`, `Key`, `ZeroDivision`, `Overflow`, `Io` (keeps the `io::Error` as its `source()`), `Permission`, `Limit` (which limit, as a `LimitExceeded`: `ExprDepth`, `NestingDepth`, `EvalDepth`, `Steps`, `Size`), `Interrupted`, `Killed`, `Native`, `Panic`
 * `Native` is an error returned by a host function, passed through untouched. `error.downcast_native::<MyError>()` gets the original back, and it's also the `source()`. Host functions get this by returning `Result<T, Box<dyn Error + Send + Sync>>` or using `Error::native(e)`. Returning a `String`/`&str` error is a ValueError, an `io::Error` is an IOError, and returning a `femtopython::Error` keeps its kind
 * `error.class()` gives the python-style exception class (`ErrorClass::Type` = TypeError etc) for coarse matching
 * `Display` is python-style: `TypeError: ...`. `error.render(src)` adds the line/col and a caret under the source
@@ -199,13 +209,14 @@ Everything has a limit so a script can't take the host down. All configurable.
 * evaluation depth (400, expressions + calls). Deep evaluation grows the stack onto the heap instead of overflowing, so recursion is always an error and never a crash
 * steps (statements, loop iterations, iterator items), 10M by default, unlimited in the repl
 * string/bytes size from concatenation, file reads and `json.dumps`, 16MiB
-* an interrupt flag the host can set from any thread (ctrl-c in the repl)
+* an interrupt flag the host can set from any thread, plus killing (see above)
 
 # Parsing
 Input is fully recognized before any of it runs: a regular lexer with a bounded indentation stack, an LR(1) grammar (lalrpop), then a static check (`return` only in functions, `break`/`continue` only in loops, no duplicate params). Python keywords that aren't supported (`import`, `class`, `try`, ...) are reserved and give a clear error.
 
 # Repl
 `femtopython` binary, behind the default-on `repl` feature.
+* Ctrl-C kills whatever is running (it's run with `spawn`) and prints `KeyboardInterrupt`. In the repl you're back at the prompt with the globals as they were. Running a file or `-c`, it exits with status 130. A second Ctrl-C before the first lands (e.g. stuck in a host function) exits immediately
 * `femtopython` for a `>>>` prompt, `femtopython file.py` to run a file, `-c code` to run code, `-i` to drop into the prompt after
 * `open` reads files normally, like python. `--no-fs` turns it off, `--allow-path PATH` (repeatable, file or dir) switches to the allowlist
 * `--max-eval-depth`, `--max-steps`

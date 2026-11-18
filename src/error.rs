@@ -112,6 +112,15 @@ pub enum ErrorKind {
     /// The host set the interrupt flag (see `Interpreter::interrupt_handle`).
     #[error("KeyboardInterrupt")]
     Interrupted,
+    /// The script was killed by the host (a step hook returned
+    /// [`StepControl::Stop`](crate::StepControl::Stop), e.g. via
+    /// [`ScriptHandle::kill`](crate::ScriptHandle::kill)).
+    #[error("Killed")]
+    Killed,
+    /// A host function panicked. The panic was caught at the interpreter
+    /// thread boundary (see [`Interpreter::spawn`](crate::Interpreter::spawn)).
+    #[error("a native function panicked: {0}")]
+    Panic(String),
     /// An error returned by a host function, passed through untouched. Use
     /// [`Error::downcast_native`] to get the original back.
     #[error("{0}")]
@@ -132,7 +141,8 @@ impl ErrorKind {
             ErrorKind::Io { .. } => ErrorClass::Io,
             ErrorKind::Permission(_) => ErrorClass::Permission,
             ErrorKind::Limit(_) => ErrorClass::Limit,
-            ErrorKind::Interrupted => ErrorClass::Interrupted,
+            ErrorKind::Interrupted | ErrorKind::Killed => ErrorClass::Interrupted,
+            ErrorKind::Panic(_) => ErrorClass::Native,
             ErrorKind::Native(_) => ErrorClass::Native,
         }
     }
