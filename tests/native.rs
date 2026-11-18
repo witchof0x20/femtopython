@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Static analysis.
 //!
 //! * [`check_program`] validates a whole program before any of it runs:

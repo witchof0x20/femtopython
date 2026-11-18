@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Runtime values.
 //!
 //! Collections have *value semantics* (like Rust's owned `Vec`/`HashMap`):

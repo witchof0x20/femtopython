@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 // LR(1) grammar for femtopython. Tokens (including INDENT/DEDENT) come from
 // the hand-written lexer in lexer.rs.
 

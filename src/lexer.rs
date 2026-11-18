@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Hand-written lexer. The token language is regular apart from indentation,
 //! which is tracked with an explicit, bounded stack and turned into
 //! `Indent`/`Dedent` tokens so the grammar itself stays context-free.

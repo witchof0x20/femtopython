@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Abstract syntax tree.
 //!
 //! Expressions are depth-limited at construction ([`Expr::new`]), so the

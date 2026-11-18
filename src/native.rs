@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Exposing Rust functions to scripts.
 //!
 //! Any `Fn(A, B, ...) -> R` (up to 8 arguments) whose argument types

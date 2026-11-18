@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! What `open()` does, as decided by the host.
 //!
 //! The interpreter never touches the filesystem itself: `open(path)` calls

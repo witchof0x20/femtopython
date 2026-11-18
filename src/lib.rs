@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! femtopython: a small, strictly-typed, embeddable subset of Python.
 //!
 //! The entry point is [`Interpreter`]. Source text goes through a full

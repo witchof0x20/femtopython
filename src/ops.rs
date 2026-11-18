@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Operator semantics. These mirror Rust's primitive operators: both
 //! operands must have the same type, integer arithmetic is checked (overflow
 //! is an error, as in a debug build), `/` on integers truncates, and `%` is

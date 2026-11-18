@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Glue between the lexer and the lalrpop-generated parser.
 
 use lalrpop_util::{ParseError, lalrpop_mod};

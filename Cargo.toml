@@ -3,6 +3,9 @@ name = "femtopython"
 version = "0.1.0"
 edition = "2024"
 description = "A small, strictly-typed, embeddable subset of Python"
+authors = ["jade"]
+license = "GPL-3.0-only"
+repository = "https://github.com/witchof0x20/femtopython"
 
 [dependencies]
 cap-std = "4.0.3"

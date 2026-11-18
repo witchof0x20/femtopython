@@ -1,3 +1,6 @@
+// Copyright (C) 2026 jade
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Tree-walking evaluator and the embeddable [`Interpreter`] object.
 //!
 //! # Scoping
