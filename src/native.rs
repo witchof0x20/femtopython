@@ -302,7 +302,7 @@ impl IntoScriptError for std::io::Error {
 }
 
 /// Any other host error: aborts the script and reaches the caller as
-/// [`ErrorKind::Native`](crate::ErrorKind::Native), downcastable with
+/// [`ErrorKind::Native`], downcastable with
 /// [`Error::downcast_native`].
 impl IntoScriptError for Box<dyn std::error::Error + Send + Sync> {
     fn into_script_error(self) -> Error {
