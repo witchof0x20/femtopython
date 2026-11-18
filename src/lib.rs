@@ -9,6 +9,7 @@ mod ast;
 mod check;
 pub mod error;
 mod interp;
+mod json;
 mod lexer;
 pub mod native;
 mod ops;

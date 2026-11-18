@@ -482,6 +482,7 @@ impl Value {
                 }
             },
             Value::Function(f) => write!(out, "<function {}>", f.name).unwrap(),
+            Value::Builtin(Builtin::Json) => out.push_str("<module 'json'>"),
             Value::Builtin(b) => write!(out, "<built-in function {}>", b.name()).unwrap(),
             Value::Native(n) => write!(out, "<native function {}>", n.name).unwrap(),
             Value::Path(p) => {

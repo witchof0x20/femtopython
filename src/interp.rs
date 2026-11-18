@@ -265,6 +265,10 @@ pub enum Builtin {
     Len,
     List,
     Set,
+    /// The `json` namespace; `json.loads` / `json.dumps` are attributes.
+    Json,
+    JsonLoads,
+    JsonDumps,
     /// A type used as a conversion function, e.g. `u8(x)` or `Path("a")`.
     Convert(Type),
 }
@@ -279,6 +283,7 @@ impl Builtin {
             "len" => Builtin::Len,
             "list" => Builtin::List,
             "set" => Builtin::Set,
+            "json" => Builtin::Json,
             "bool" | "i8" | "i16" | "i32" | "i64" | "int" | "u8" | "u16" | "u32" | "u64"
             | "f32" | "f64" | "float" | "str" | "bytes" | "Path" => {
                 Builtin::Convert(Type::from_name(name, vec![]).expect("known type name"))
@@ -296,6 +301,9 @@ impl Builtin {
             Builtin::Len => "len".into(),
             Builtin::List => "list".into(),
             Builtin::Set => "set".into(),
+            Builtin::Json => "json".into(),
+            Builtin::JsonLoads => "json.loads".into(),
+            Builtin::JsonDumps => "json.dumps".into(),
             Builtin::Convert(t) => t.to_string(),
         }
     }
@@ -305,6 +313,8 @@ impl Builtin {
         match self {
             Builtin::Print => Type::optional(Type::Bool),
             Builtin::Len => Type::I64,
+            Builtin::JsonDumps => Type::Str,
+            Builtin::JsonLoads => Type::Any,
             _ => Type::Unknown,
         }
     }
@@ -886,7 +896,12 @@ impl Interpreter {
                 let keys: Vec<&Expr> = entries.iter().map(|(k, _)| k).collect();
                 let vals: Vec<&Expr> = entries.iter().map(|(_, v)| v).collect();
                 let keys = self.eval_group(&keys, env, kh)?;
-                let vals = self.eval_group(&vals, env, vh)?;
+                // Values are heterogeneous (JSON-style), so each literal is
+                // typed on its own rather than unified with its siblings.
+                let vals = vals
+                    .into_iter()
+                    .map(|v| self.eval_expr(v, env, vh))
+                    .collect::<Result<Vec<_>>>()?;
                 let (k0, v0) = if keys.is_empty() {
                     (kh.cloned(), vh.cloned())
                 } else {
@@ -978,7 +993,7 @@ impl Interpreter {
                     self.eval_expr(orelse, env, hint)?
                 }
             }
-            ExprKind::Call(callee, args) => return self.eval_call(callee, args, env),
+            ExprKind::Call(callee, args) => return self.eval_call(callee, args, env, hint),
             ExprKind::Index(base, idx) => {
                 let base = self.eval_expr(base, env, None)?;
                 let idx_hint = match base.type_of() {
@@ -990,6 +1005,9 @@ impl Interpreter {
             }
             ExprKind::Attr(obj, name) => {
                 let obj = self.eval_expr(obj, env, None)?;
+                if let Value::Builtin(Builtin::Json) = obj {
+                    return module_attr(&obj, name);
+                }
                 return Err(err!(
                     Type,
                     "'{}' attribute '{name}' must be called as a method",
@@ -1006,25 +1024,38 @@ impl Interpreter {
         })
     }
 
-    fn eval_call(&mut self, callee: &Expr, args: &[Expr], env: &mut Env) -> Result<Value> {
-        if let ExprKind::Attr(obj, method) = &callee.kind {
+    /// `hint` is the type the context expects of the call's result. It lets
+    /// `json.dumps` and `file.read` produce `bytes` instead of `str`.
+    fn eval_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        env: &mut Env,
+        hint: Option<&Type>,
+    ) -> Result<Value> {
+        let f = if let ExprKind::Attr(obj, method) = &callee.kind {
             if is_mutating_method(method) {
                 return self.call_mutating_method(obj, method, args, env);
             }
             let obj = self.eval_expr(obj, env, None)?;
-            let hint = match (&obj, method.as_str()) {
-                (Value::Dict(d), "get") => Some(d.key.clone()),
-                _ => None,
-            };
-            let mut vals = Vec::with_capacity(args.len());
-            for (i, a) in args.iter().enumerate() {
-                let h = if i == 0 { hint.as_ref() } else { None };
-                vals.push(self.eval_expr(a, env, h)?);
+            if let Value::Builtin(Builtin::Json) = obj {
+                module_attr(&obj, method)?
+            } else {
+                let arg_hint = match (&obj, method.as_str()) {
+                    (Value::Dict(d), "get") => Some(d.key.clone()),
+                    _ => None,
+                };
+                let mut vals = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    let h = if i == 0 { arg_hint.as_ref() } else { None };
+                    vals.push(self.eval_expr(a, env, h)?);
+                }
+                return self.call_method(&obj, method, vals, hint);
             }
-            return self.call_method(&obj, method, vals);
-        }
-        let f = self.eval_expr(callee, env, None)?;
-        let vals = if f == Value::Builtin(Builtin::Range) {
+        } else {
+            self.eval_expr(callee, env, None)?
+        };
+        let vals = if matches!(f, Value::Builtin(Builtin::Range)) {
             let refs: Vec<&Expr> = args.iter().collect();
             self.eval_group(&refs, env, None)?
         } else {
@@ -1048,7 +1079,13 @@ impl Interpreter {
             }
             vals
         };
-        self.call_value(&f, vals)
+        let out = self.call_value(&f, vals)?;
+        Ok(match (&f, out) {
+            (Value::Builtin(Builtin::JsonDumps), Value::Str(s)) if wants_bytes(hint) => {
+                Value::Bytes(s.as_bytes().into())
+            }
+            (_, out) => out,
+        })
     }
 
     fn eval_bool(&mut self, e: &Expr, env: &mut Env, what: &str) -> Result<bool> {
@@ -1300,11 +1337,6 @@ impl Interpreter {
                         (elem, self.collect(src)?)
                     }
                 };
-                let elem = if items.is_empty() {
-                    elem
-                } else {
-                    Type::Unknown
-                };
                 if *b == Builtin::List {
                     Value::new_list(elem, items)
                 } else {
@@ -1335,10 +1367,38 @@ impl Interpreter {
                 arity(1..=1)?;
                 ops::convert(t, &args[0])
             }
+            Builtin::Json => Err(err!(Type, "module 'json' is not callable")),
+            Builtin::JsonLoads => {
+                arity(1..=1)?;
+                match &args[0] {
+                    Value::Str(s) => crate::json::loads(s),
+                    Value::Bytes(b) => crate::json::loads(
+                        std::str::from_utf8(b)
+                            .map_err(|e| err!(Value, "JSON input is not valid UTF-8: {e}"))?,
+                    ),
+                    other => Err(err!(
+                        Type,
+                        "json.loads() expects str or bytes, not '{}'",
+                        other.type_of()
+                    )),
+                }
+            }
+            Builtin::JsonDumps => {
+                arity(1..=1)?;
+                Ok(Value::Str(
+                    crate::json::dumps(&args[0], self.config.max_str_len)?.into(),
+                ))
+            }
         }
     }
 
-    fn call_method(&mut self, obj: &Value, method: &str, args: Vec<Value>) -> Result<Value> {
+    fn call_method(
+        &mut self,
+        obj: &Value,
+        method: &str,
+        args: Vec<Value>,
+        hint: Option<&Type>,
+    ) -> Result<Value> {
         let arity = |range: std::ops::RangeInclusive<usize>| {
             if range.contains(&args.len()) {
                 Ok(())
@@ -1379,6 +1439,9 @@ impl Interpreter {
                     .map_err(|e| err!(Io, "read failed: {e}"))?;
                 if buf.len() > limit {
                     return Err(err!(Limit, "file is larger than {limit} bytes"));
+                }
+                if wants_bytes(hint) {
+                    return Ok(Value::Bytes(buf.into()));
                 }
                 let s = String::from_utf8(buf)
                     .map_err(|e| err!(Value, "file is not valid UTF-8: {e}"))?;
@@ -1568,6 +1631,25 @@ fn capture(env: &Env, free: &FreeVars, fname: &str) -> Result<Arc<Vec<(String, S
         }
     }
     Ok(Arc::new(out))
+}
+
+/// Whether the context wants `bytes` (for functions that can produce either
+/// `str` or `bytes`).
+fn wants_bytes(hint: Option<&Type>) -> bool {
+    match hint {
+        Some(Type::Bytes) => true,
+        Some(Type::Optional(t)) => **t == Type::Bytes,
+        _ => false,
+    }
+}
+
+/// `module.name` for builtin modules.
+fn module_attr(module: &Value, name: &str) -> Result<Value> {
+    match (module, name) {
+        (Value::Builtin(Builtin::Json), "loads") => Ok(Value::Builtin(Builtin::JsonLoads)),
+        (Value::Builtin(Builtin::Json), "dumps") => Ok(Value::Builtin(Builtin::JsonDumps)),
+        _ => Err(err!(Type, "module 'json' has no attribute '{name}'")),
+    }
 }
 
 /// Whether values of type `t` may contain functions (and so, through their

@@ -42,7 +42,7 @@ Primitives should be usable like in python, where they can act as functions. If 
 ### Dicts
 * `dict[K, V]`
 * No mixed key types. Keys have to be hashable (no floats, same as rust)
-* Values can be mixed, think json. A dict built from literals widens its value type to `Any` when it sees a new type. Once a dict has been checked against an annotation (`d: dict[str, int]`, a typed param, a typed return) its value type is fixed and mismatches are an error
+* Values can be mixed, think json. Literal values in a dict are typed on their own, so `{'a': 1, 'b': 2.5}` keeps the 1 an int. A dict built from literals widens its value type to `Any` when it sees a new type. Once a dict has been checked against an annotation (`d: dict[str, int]`, a typed param, a typed return) its value type is fixed and mismatches are an error
 * Insertion ordered
 * `.keys() .values() .items()` return lazy views (see Iterables)
 * `.get(k)` returns `Optional[V]`, `.get(k, default)`, `.pop(k)`, `.pop(k, default)`, `.clear()`
@@ -69,7 +69,7 @@ Primitives should be usable like in python, where they can act as functions. If 
 * Unannotated params / returns are unknown and are compatible with anything
 ### Paths / files
 * `Path`, basically a PathBuf. `/` joins (`Path("a") / "b"`)
-* `File`, what `open` returns. `.read()` reads the rest of it as a str
+* `File`, what `open` returns. `.read()` reads the rest of it as a str, or as bytes if the context wants bytes (`b: bytes = f.read()`, a bytes param, a `-> bytes` return), in which case it isn't utf-8 checked
 ### Copy on write
 Lists, dicts and sets are values, like owned rust collections. `b = a` then `b[0] = 1` does not change `a`. Under the hood they're shared and only copied when written to, so passing them around is cheap.
 
@@ -158,6 +158,15 @@ All operations should operate basically the same as their equivalent rust primit
 * open(filename: str|Path), read only. Off unless the host turns it on
 * Path(str) (under the hood this should just be PathBuf basically and only really exist to be used for open and support / sugar)
 * the type names as conversion functions, see the top
+* `json.loads(s)`, s is str or bytes (utf-8). Returns `Any`
+  * objects become dicts (str keys, values widen like any literal-built dict), arrays become lists (`list[Any]` if mixed), integers become int, numbers with a fraction or exponent become float
+  * strict json: no trailing commas, comments, NaN/Infinity or lone surrogates. Integers that don't fit int are an error. Duplicate keys, the last one wins
+  * invalid json is an error, not `None` (since `null` is valid json)
+* `json.dumps(v)`, returns str, or bytes if the context wants bytes (same as `.read()`)
+  * same format as python's default: `", "` and `": "` separators, non-ascii escaped
+  * lists and tuples become arrays. int/bool/None dict keys get stringified like python
+  * sets, bytes, functions, paths and views are errors. NaN and inf are errors
+* `json` itself isn't a module system, there's no `import`. It's just a builtin namespace, and `json.loads` / `json.dumps` are first class like anything else
 
 # Embedding
 * `Interpreter` is the object. `run(src)` runs statements and returns the last expression's value, `eval(src)` evaluates one expression, `call(f, args)` calls a script function from rust. Globals stick around between runs
@@ -169,10 +178,10 @@ All operations should operate basically the same as their equivalent rust primit
 ## Limits
 Everything has a limit so a script can't take the host down. All configurable.
 * filesystem off by default
-* expression nesting (200), type/value nesting (32), indentation depth (64), `map` nesting (32)
+* expression nesting (200), type/value nesting (32, json nesting too), indentation depth (64), `map` nesting (32)
 * evaluation depth (400, expressions + calls). Deep evaluation grows the stack onto the heap instead of overflowing, so recursion is always an error and never a crash
 * steps (statements, loop iterations, iterator items), 10M by default, unlimited in the repl
-* string/bytes size from concatenation and file reads, 16MiB
+* string/bytes size from concatenation, file reads and `json.dumps`, 16MiB
 * an interrupt flag the host can set from any thread (ctrl-c in the repl)
 
 # Parsing

@@ -254,6 +254,11 @@ fn dict_values_are_heterogeneous_like_json() {
         Value::from("two")
     );
     assert_eq!(run("d = {'a': 1, 'b': 'x'}\nd['a'] + 1"), Value::I64(2));
+    assert_eq!(repr("{'a': 1, 'b': 2.5}"), "{'a': 1, 'b': 2.5}");
+    assert_eq!(
+        repr("d: dict[str, float] = {'a': 1, 'b': 2.5}\nd"),
+        "{'a': 1.0, 'b': 2.5}"
+    );
     // A nested JSON-ish document.
     assert_eq!(
         run(
@@ -423,6 +428,7 @@ fn for_loops() {
     );
     assert_eq!(repr("list(range(5, 0, -2))"), "[5, 3, 1]");
     assert_eq!(repr("x: u8 = 3\nlist(range(x))"), "[0, 1, 2]");
+    assert_eq!(repr("x: u8 = 1\nlist(range(x, 3))"), "[1, 2]");
     assert_eq!(fails("for a, b in [1, 2]:\n    pass"), ErrorKind::Type);
     assert_eq!(fails("break"), ErrorKind::Syntax);
     assert_eq!(fails("def f():\n    continue"), ErrorKind::Syntax);
@@ -857,6 +863,21 @@ fn paths_and_open() {
     assert_eq!(
         i.run("open(dir / 'f.txt').read()").unwrap(),
         Value::from("contents")
+    );
+    // `.read()` gives bytes when the context wants bytes, without decoding.
+    std::fs::write(dir.join("bin"), [0xff, 0x00]).unwrap();
+    assert_eq!(
+        i.run("b: bytes = open(dir / 'bin').read()\nb").unwrap(),
+        Value::Bytes([0xff, 0x00].as_slice().into())
+    );
+    assert_eq!(
+        i.run("open(dir / 'bin').read()").unwrap_err().kind,
+        ErrorKind::Value
+    );
+    assert_eq!(
+        i.run("def size(b: bytes) -> int: return len(b)\nsize(open(dir / 'bin').read())")
+            .unwrap(),
+        Value::I64(2)
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
