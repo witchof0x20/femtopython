@@ -1,14 +1,13 @@
 //! Runtime values.
 //!
 //! Collections have *value semantics* (like Rust's owned `Vec`/`HashMap`):
-//! they are `Rc`-shared and copied on write via [`Rc::make_mut`], so
-//! `b = a; b[0] = 1` never changes `a`. Values cannot form reference cycles,
-//! and their nesting depth is bounded by [`MAX_TYPE_DEPTH`].
+//! they are `Arc`-shared and copied on write via [`Arc::make_mut`], so
+//! `b = a; b[0] = 1` never changes `a`. Everything is `Send + Sync`, and
+//! value nesting depth is bounded by [`MAX_TYPE_DEPTH`].
 
-use std::cell::RefCell;
 use std::fmt::{self, Write as _};
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use indexmap::{IndexMap, IndexSet};
 
@@ -31,17 +30,19 @@ pub enum Value {
     U64(u64),
     F32(f32),
     F64(f64),
-    Str(Rc<str>),
-    Bytes(Rc<[u8]>),
-    List(Rc<List>),
-    Dict(Rc<Dict>),
-    Set(Rc<Set>),
-    Tuple(Rc<[Value]>),
-    Function(Rc<Function>),
+    Str(Arc<str>),
+    Bytes(Arc<[u8]>),
+    List(Arc<List>),
+    Dict(Arc<Dict>),
+    Set(Arc<Set>),
+    Tuple(Arc<[Value]>),
+    /// A lazy, re-iterable view.
+    Iter(Arc<IterView>),
+    Function(Arc<Function>),
     Builtin(Builtin),
-    Native(Rc<NativeFn>),
-    Path(Rc<PathBuf>),
-    File(Rc<RefCell<FileHandle>>),
+    Native(Arc<NativeFn>),
+    Path(Arc<PathBuf>),
+    File(Arc<Mutex<FileHandle>>),
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +55,10 @@ pub struct List {
 pub struct Dict {
     pub key: Type,
     pub val: Type,
+    /// Whether `val` came from an annotation. Inferred dicts widen their
+    /// value type to `Any` when given a value of a new type (JSON-style
+    /// objects); annotated ones reject it.
+    pub val_fixed: bool,
     pub map: IndexMap<Key, Value>,
 }
 
@@ -61,6 +66,58 @@ pub struct Dict {
 pub struct Set {
     pub elem: Type,
     pub items: IndexSet<Key>,
+}
+
+/// Lazy iterables. Each holds a snapshot of its source (value semantics),
+/// so iterating it never observes later mutation and can be repeated.
+#[derive(Debug)]
+pub enum IterView {
+    Range {
+        start: i128,
+        stop: i128,
+        step: i128,
+        ty: Type,
+    },
+    Map {
+        f: Value,
+        src: Value,
+        elem: Type,
+    },
+    Keys(Arc<Dict>),
+    Values(Arc<Dict>),
+    Items(Arc<Dict>),
+}
+
+impl IterView {
+    pub fn elem_type(&self) -> Type {
+        match self {
+            IterView::Range { ty, .. } => ty.clone(),
+            IterView::Map { elem, .. } => elem.clone(),
+            IterView::Keys(d) => d.key.clone(),
+            IterView::Values(d) => d.val.clone(),
+            IterView::Items(d) => Type::Tuple(vec![d.key.clone(), d.val.clone()]),
+        }
+    }
+
+    /// Number of items, if known without running user code.
+    pub fn known_len(&self) -> Option<usize> {
+        match self {
+            IterView::Range {
+                start, stop, step, ..
+            } => Some(range_len(*start, *stop, *step)),
+            IterView::Map { .. } => None,
+            IterView::Keys(d) | IterView::Values(d) | IterView::Items(d) => Some(d.map.len()),
+        }
+    }
+}
+
+pub fn range_len(start: i128, stop: i128, step: i128) -> usize {
+    let n = if step > 0 {
+        (stop - start + step - 1).div_euclid(step)
+    } else {
+        (start - stop - step - 1).div_euclid(-step)
+    };
+    n.max(0) as usize
 }
 
 #[derive(Debug)]
@@ -83,10 +140,10 @@ pub enum Key {
     U16(u16),
     U32(u32),
     U64(u64),
-    Str(Rc<str>),
-    Bytes(Rc<[u8]>),
-    Path(Rc<PathBuf>),
-    Tuple(Rc<[Key]>),
+    Str(Arc<str>),
+    Bytes(Arc<[u8]>),
+    Path(Arc<PathBuf>),
+    Tuple(Arc<[Key]>),
 }
 
 impl Key {
@@ -136,7 +193,7 @@ impl Key {
     }
 }
 
-fn check_depth(ty: &Type) -> Result<()> {
+pub(crate) fn check_depth(ty: &Type) -> Result<()> {
     if ty.depth() >= MAX_TYPE_DEPTH {
         Err(err!(
             Limit,
@@ -148,11 +205,7 @@ fn check_depth(ty: &Type) -> Result<()> {
 }
 
 /// Unify the types of `items`, starting from `elem`. Errors on mixed types.
-fn unify_all<'a>(
-    what: &str,
-    mut elem: Type,
-    types: impl Iterator<Item = Type> + 'a,
-) -> Result<Type> {
+fn unify_all(what: &str, mut elem: Type, types: impl Iterator<Item = Type>) -> Result<Type> {
     for t in types {
         elem = elem
             .unify(&t)
@@ -162,11 +215,11 @@ fn unify_all<'a>(
 }
 
 impl Value {
-    /// Build a list, checking that every item has the same type.
+    /// Build a list, checking that every item has a compatible type.
     pub fn new_list(elem: Type, items: Vec<Value>) -> Result<Value> {
         let elem = unify_all("list", elem, items.iter().map(Value::type_of))?;
         check_depth(&elem)?;
-        Ok(Value::List(Rc::new(List { elem, items })))
+        Ok(Value::List(Arc::new(List { elem, items })))
     }
 
     pub fn new_set(elem: Type, items: Vec<Value>) -> Result<Value> {
@@ -176,12 +229,15 @@ impl Value {
             return Err(err!(Type, "unhashable type: '{elem}'"));
         }
         let items = items.iter().map(Key::from_value).collect::<Result<_>>()?;
-        Ok(Value::Set(Rc::new(Set { elem, items })))
+        Ok(Value::Set(Arc::new(Set { elem, items })))
     }
 
+    /// Build a dict. Keys must share a type; values widen to `Any` if mixed.
     pub fn new_dict(key: Type, val: Type, entries: Vec<(Value, Value)>) -> Result<Value> {
         let key = unify_all("dict keys", key, entries.iter().map(|(k, _)| k.type_of()))?;
-        let val = unify_all("dict values", val, entries.iter().map(|(_, v)| v.type_of()))?;
+        let val = entries.iter().fold(val, |acc, (_, v)| {
+            acc.unify(&v.type_of()).unwrap_or(Type::Any)
+        });
         check_depth(&key)?;
         check_depth(&val)?;
         if !key.is_hashable() {
@@ -191,7 +247,12 @@ impl Value {
         for (k, v) in entries {
             map.insert(Key::from_value(&k)?, v);
         }
-        Ok(Value::Dict(Rc::new(Dict { key, val, map })))
+        Ok(Value::Dict(Arc::new(Dict {
+            key,
+            val,
+            val_fixed: false,
+            map,
+        })))
     }
 
     pub fn new_tuple(items: Vec<Value>) -> Result<Value> {
@@ -200,7 +261,7 @@ impl Value {
         Ok(v)
     }
 
-    pub fn str(s: impl Into<Rc<str>>) -> Value {
+    pub fn str(s: impl Into<Arc<str>>) -> Value {
         Value::Str(s.into())
     }
 
@@ -224,7 +285,10 @@ impl Value {
             Value::Dict(d) => Type::Dict(Box::new(d.key.clone()), Box::new(d.val.clone())),
             Value::Set(s) => Type::Set(Box::new(s.elem.clone())),
             Value::Tuple(items) => Type::Tuple(items.iter().map(Value::type_of).collect()),
-            Value::Function(_) | Value::Builtin(_) | Value::Native(_) => Type::Function,
+            Value::Iter(v) => Type::Iterable(Box::new(v.elem_type())),
+            Value::Function(f) => f.signature(),
+            Value::Builtin(_) => Type::Function(None),
+            Value::Native(n) => n.signature(),
             Value::Path(_) => Type::Path,
             Value::File(_) => Type::File,
         }
@@ -237,26 +301,37 @@ impl Value {
         )
     }
 
-    /// Replace `Unknown` element types (from empty collections) with the
-    /// corresponding parts of `ty`. Assumes `ty.accepts(self.type_of())`.
+    /// Adopt the annotated type `ty` (which must accept this value): fills
+    /// in `Unknown` element types from empty collections and fixes dict
+    /// value types so they stop widening.
     pub fn refine(&mut self, ty: &Type) {
+        let ty = match ty {
+            Type::Optional(t) => &**t,
+            t => t,
+        };
+        if ty.has_unknown() {
+            return;
+        }
         match (self, ty) {
             (Value::List(l), Type::List(t)) if l.elem != **t => {
-                if let Some(u) = l.elem.unify(t) {
-                    Rc::make_mut(l).elem = u;
-                }
+                let l = Arc::make_mut(l);
+                l.elem = (**t).clone();
+                l.items.iter_mut().for_each(|v| v.refine(t));
             }
             (Value::Set(s), Type::Set(t)) if s.elem != **t => {
-                if let Some(u) = s.elem.unify(t) {
-                    Rc::make_mut(s).elem = u;
-                }
+                Arc::make_mut(s).elem = (**t).clone();
             }
-            (Value::Dict(d), Type::Dict(k, v)) if d.key != **k || d.val != **v => {
-                if let (Some(k), Some(v)) = (d.key.unify(k), d.val.unify(v)) {
-                    let d = Rc::make_mut(d);
-                    d.key = k;
-                    d.val = v;
-                }
+            (Value::Dict(d), Type::Dict(k, v)) if d.key != **k || d.val != **v || !d.val_fixed => {
+                let d = Arc::make_mut(d);
+                d.key = (**k).clone();
+                d.val = (**v).clone();
+                d.val_fixed = true;
+                d.map.values_mut().for_each(|x| x.refine(v));
+            }
+            (Value::Tuple(items), Type::Tuple(ts)) if items.len() == ts.len() => {
+                let mut new: Vec<Value> = items.to_vec();
+                new.iter_mut().zip(ts).for_each(|(v, t)| v.refine(t));
+                *items = new.into();
             }
             _ => {}
         }
@@ -315,6 +390,14 @@ impl Value {
                 v.write_repr(out);
             }
         }
+        fn keys<'a>(out: &mut String, items: impl Iterator<Item = &'a Key>) {
+            for (i, k) in items.enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                k.to_value().write_repr(out);
+            }
+        }
         match self {
             Value::None => out.push_str("None"),
             Value::Bool(true) => out.push_str("True"),
@@ -347,8 +430,7 @@ impl Value {
             Value::Set(s) if s.items.is_empty() => out.push_str("set()"),
             Value::Set(s) => {
                 out.push('{');
-                let vals: Vec<_> = s.items.iter().map(Key::to_value).collect();
-                seq(out, vals.iter());
+                keys(out, s.items.iter());
                 out.push('}');
             }
             Value::Dict(d) => {
@@ -363,6 +445,42 @@ impl Value {
                 }
                 out.push('}');
             }
+            Value::Iter(view) => match &**view {
+                IterView::Range {
+                    start, stop, step, ..
+                } => {
+                    if *step == 1 {
+                        write!(out, "range({start}, {stop})").unwrap()
+                    } else {
+                        write!(out, "range({start}, {stop}, {step})").unwrap()
+                    }
+                }
+                IterView::Map { .. } => out.push_str("<map object>"),
+                IterView::Keys(d) => {
+                    out.push_str("dict_keys([");
+                    keys(out, d.map.keys());
+                    out.push_str("])");
+                }
+                IterView::Values(d) => {
+                    out.push_str("dict_values([");
+                    seq(out, d.map.values());
+                    out.push_str("])");
+                }
+                IterView::Items(d) => {
+                    out.push_str("dict_items([");
+                    for (i, (k, v)) in d.map.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        out.push('(');
+                        k.to_value().write_repr(out);
+                        out.push_str(", ");
+                        v.write_repr(out);
+                        out.push(')');
+                    }
+                    out.push_str("])");
+                }
+            },
             Value::Function(f) => write!(out, "<function {}>", f.name).unwrap(),
             Value::Builtin(b) => write!(out, "<built-in function {}>", b.name()).unwrap(),
             Value::Native(n) => write!(out, "<native function {}>", n.name).unwrap(),
@@ -372,8 +490,9 @@ impl Value {
                 out.push(')');
             }
             Value::File(f) => {
+                let f = f.lock().unwrap_or_else(|e| e.into_inner());
                 out.push_str("<file ");
-                write_str_repr(out, &f.borrow().path.to_string_lossy());
+                write_str_repr(out, &f.path.to_string_lossy());
                 out.push('>');
             }
         }
@@ -506,7 +625,7 @@ impl From<()> for Value {
 
 impl From<PathBuf> for Value {
     fn from(p: PathBuf) -> Value {
-        Value::Path(Rc::new(p))
+        Value::Path(Arc::new(p))
     }
 }
 

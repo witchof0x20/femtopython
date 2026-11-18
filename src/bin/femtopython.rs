@@ -30,6 +30,11 @@ struct Args {
     /// Maximum evaluation nesting depth (expressions plus calls).
     #[arg(long, value_name = "N", default_value_t = Config::default().max_eval_depth)]
     max_eval_depth: usize,
+
+    /// Maximum number of steps per run (unlimited by default; Ctrl-C
+    /// interrupts a running script).
+    #[arg(long, value_name = "N")]
+    max_steps: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -37,8 +42,17 @@ fn main() -> ExitCode {
     let mut interp = Interpreter::with_config(Config {
         allow_fs: args.allow_fs,
         max_eval_depth: args.max_eval_depth,
+        max_steps: args.max_steps,
         ..Config::default()
     });
+    // Ctrl-C while a script runs interrupts it. (While reading input,
+    // rustyline sees Ctrl-C as a key press instead.)
+    let flag = interp.interrupt_handle();
+    if let Err(e) = ctrlc::set_handler(move || {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }) {
+        eprintln!("femtopython: warning: cannot install Ctrl-C handler: {e}");
+    }
 
     let script = match (&args.command, &args.file) {
         (Some(code), _) => Some(code.clone()),
@@ -73,11 +87,13 @@ fn main() -> ExitCode {
     }
 }
 
-/// A `def` needs a terminating blank line, as in CPython's REPL.
+/// Compound statements need a terminating blank line, as in CPython's REPL.
 fn starts_block(src: &str) -> bool {
-    src.trim_start()
-        .strip_prefix("def")
-        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    let src = src.trim_start();
+    ["def", "if", "while", "for"].iter().any(|kw| {
+        src.strip_prefix(kw)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace() || c == '('))
+    })
 }
 
 fn repl(interp: &mut Interpreter) -> Result<(), ReadlineError> {

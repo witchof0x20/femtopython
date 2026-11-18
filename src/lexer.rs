@@ -3,7 +3,7 @@
 //! `Indent`/`Dedent` tokens so the grammar itself stays context-free.
 
 use std::fmt;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
@@ -18,8 +18,8 @@ pub enum Tok {
     Name(String),
     Int(u64),
     Float(f64),
-    Str(Rc<str>),
-    Bytes(Rc<[u8]>),
+    Str(Arc<str>),
+    Bytes(Arc<[u8]>),
     // Keywords
     Def,
     Return,
@@ -31,6 +31,15 @@ pub enum Tok {
     False,
     None,
     Pass,
+    If,
+    Elif,
+    Else,
+    While,
+    For,
+    In,
+    Is,
+    Break,
+    Continue,
     // Punctuation
     LParen,
     RParen,
@@ -46,6 +55,8 @@ pub enum Tok {
     Minus,
     Star,
     Slash,
+    SlashSlash,
+    StarStar,
     Percent,
     Amp,
     Pipe,
@@ -64,6 +75,14 @@ pub enum Tok {
     MinusEq,
     StarEq,
     PercentEq,
+    SlashEq,
+    SlashSlashEq,
+    StarStarEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
 }
 
 impl fmt::Display for Tok {
@@ -87,6 +106,15 @@ impl fmt::Display for Tok {
             Tok::False => "'False'",
             Tok::None => "'None'",
             Tok::Pass => "'pass'",
+            Tok::If => "'if'",
+            Tok::Elif => "'elif'",
+            Tok::Else => "'else'",
+            Tok::While => "'while'",
+            Tok::For => "'for'",
+            Tok::In => "'in'",
+            Tok::Is => "'is'",
+            Tok::Break => "'break'",
+            Tok::Continue => "'continue'",
             Tok::LParen => "'('",
             Tok::RParen => "')'",
             Tok::LBracket => "'['",
@@ -101,6 +129,8 @@ impl fmt::Display for Tok {
             Tok::Minus => "'-'",
             Tok::Star => "'*'",
             Tok::Slash => "'/'",
+            Tok::SlashSlash => "'//'",
+            Tok::StarStar => "'**'",
             Tok::Percent => "'%'",
             Tok::Amp => "'&'",
             Tok::Pipe => "'|'",
@@ -119,6 +149,14 @@ impl fmt::Display for Tok {
             Tok::MinusEq => "'-='",
             Tok::StarEq => "'*='",
             Tok::PercentEq => "'%='",
+            Tok::SlashEq => "'/='",
+            Tok::SlashSlashEq => "'//='",
+            Tok::StarStarEq => "'**='",
+            Tok::AmpEq => "'&='",
+            Tok::PipeEq => "'|='",
+            Tok::CaretEq => "'^='",
+            Tok::ShlEq => "'<<='",
+            Tok::ShrEq => "'>>='",
         };
         f.write_str(s)
     }
@@ -303,6 +341,15 @@ impl Lexer<'_> {
             "False" => Tok::False,
             "None" => Tok::None,
             "pass" => Tok::Pass,
+            "if" => Tok::If,
+            "elif" => Tok::Elif,
+            "else" => Tok::Else,
+            "while" => Tok::While,
+            "for" => Tok::For,
+            "in" => Tok::In,
+            "is" => Tok::Is,
+            "break" => Tok::Break,
+            "continue" => Tok::Continue,
             w if UNSUPPORTED_KEYWORDS.contains(&w) => {
                 return Err(self.error(start, format!("'{w}' is not supported by femtopython")));
             }
@@ -472,40 +519,54 @@ impl Lexer<'_> {
 
     fn punct(&mut self) -> Result<()> {
         let start = self.pos;
-        let two = (self.peek().unwrap(), self.peek_at(1).unwrap_or(0));
-        let (tok, len) = match two {
-            (b'-', b'>') => (Tok::Arrow, 2),
-            (b'<', b'<') => (Tok::Shl, 2),
-            (b'>', b'>') => (Tok::Shr, 2),
-            (b'<', b'=') => (Tok::Le, 2),
-            (b'>', b'=') => (Tok::Ge, 2),
-            (b'=', b'=') => (Tok::EqEq, 2),
-            (b'!', b'=') => (Tok::Ne, 2),
-            (b'+', b'=') => (Tok::PlusEq, 2),
-            (b'-', b'=') => (Tok::MinusEq, 2),
-            (b'*', b'=') => (Tok::StarEq, 2),
-            (b'%', b'=') => (Tok::PercentEq, 2),
-            (b'(', _) => (Tok::LParen, 1),
-            (b')', _) => (Tok::RParen, 1),
-            (b'[', _) => (Tok::LBracket, 1),
-            (b']', _) => (Tok::RBracket, 1),
-            (b'{', _) => (Tok::LBrace, 1),
-            (b'}', _) => (Tok::RBrace, 1),
-            (b',', _) => (Tok::Comma, 1),
-            (b':', _) => (Tok::Colon, 1),
-            (b'.', _) => (Tok::Dot, 1),
-            (b'+', _) => (Tok::Plus, 1),
-            (b'-', _) => (Tok::Minus, 1),
-            (b'*', _) => (Tok::Star, 1),
-            (b'/', _) => (Tok::Slash, 1),
-            (b'%', _) => (Tok::Percent, 1),
-            (b'&', _) => (Tok::Amp, 1),
-            (b'|', _) => (Tok::Pipe, 1),
-            (b'^', _) => (Tok::Caret, 1),
-            (b'~', _) => (Tok::Tilde, 1),
-            (b'<', _) => (Tok::Lt, 1),
-            (b'>', _) => (Tok::Gt, 1),
-            (b'=', _) => (Tok::Assign, 1),
+        let three = (
+            self.peek().unwrap(),
+            self.peek_at(1).unwrap_or(0),
+            self.peek_at(2).unwrap_or(0),
+        );
+        let (tok, len) = match three {
+            (b'/', b'/', b'=') => (Tok::SlashSlashEq, 3),
+            (b'*', b'*', b'=') => (Tok::StarStarEq, 3),
+            (b'<', b'<', b'=') => (Tok::ShlEq, 3),
+            (b'>', b'>', b'=') => (Tok::ShrEq, 3),
+            (b'/', b'/', _) => (Tok::SlashSlash, 2),
+            (b'*', b'*', _) => (Tok::StarStar, 2),
+            (b'-', b'>', _) => (Tok::Arrow, 2),
+            (b'<', b'<', _) => (Tok::Shl, 2),
+            (b'>', b'>', _) => (Tok::Shr, 2),
+            (b'<', b'=', _) => (Tok::Le, 2),
+            (b'>', b'=', _) => (Tok::Ge, 2),
+            (b'=', b'=', _) => (Tok::EqEq, 2),
+            (b'!', b'=', _) => (Tok::Ne, 2),
+            (b'+', b'=', _) => (Tok::PlusEq, 2),
+            (b'-', b'=', _) => (Tok::MinusEq, 2),
+            (b'*', b'=', _) => (Tok::StarEq, 2),
+            (b'/', b'=', _) => (Tok::SlashEq, 2),
+            (b'%', b'=', _) => (Tok::PercentEq, 2),
+            (b'&', b'=', _) => (Tok::AmpEq, 2),
+            (b'|', b'=', _) => (Tok::PipeEq, 2),
+            (b'^', b'=', _) => (Tok::CaretEq, 2),
+            (b'(', _, _) => (Tok::LParen, 1),
+            (b')', _, _) => (Tok::RParen, 1),
+            (b'[', _, _) => (Tok::LBracket, 1),
+            (b']', _, _) => (Tok::RBracket, 1),
+            (b'{', _, _) => (Tok::LBrace, 1),
+            (b'}', _, _) => (Tok::RBrace, 1),
+            (b',', _, _) => (Tok::Comma, 1),
+            (b':', _, _) => (Tok::Colon, 1),
+            (b'.', _, _) => (Tok::Dot, 1),
+            (b'+', _, _) => (Tok::Plus, 1),
+            (b'-', _, _) => (Tok::Minus, 1),
+            (b'*', _, _) => (Tok::Star, 1),
+            (b'/', _, _) => (Tok::Slash, 1),
+            (b'%', _, _) => (Tok::Percent, 1),
+            (b'&', _, _) => (Tok::Amp, 1),
+            (b'|', _, _) => (Tok::Pipe, 1),
+            (b'^', _, _) => (Tok::Caret, 1),
+            (b'~', _, _) => (Tok::Tilde, 1),
+            (b'<', _, _) => (Tok::Lt, 1),
+            (b'>', _, _) => (Tok::Gt, 1),
+            (b'=', _, _) => (Tok::Assign, 1),
             _ => {
                 let c = self.src[start..].chars().next().unwrap();
                 self.pos += c.len_utf8();
@@ -585,7 +646,7 @@ mod tests {
     #[test]
     fn rejects() {
         for bad in [
-            "if x:",
+            "import x",
             "\tx",
             "'abc",
             "b'é'",

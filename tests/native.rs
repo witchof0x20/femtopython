@@ -102,9 +102,23 @@ fn compound_types() {
 
 #[test]
 fn native_functions_are_first_class() {
-    assert_eq!(ok("map(shout, ['a', 'b'])").repr(), "['A', 'B']");
+    assert_eq!(ok("list(map(shout, ['a', 'b']))").repr(), "['A', 'B']");
     // An empty map still learns its element type from the Rust signature.
-    assert_eq!(ok("r: list[str] = map(shout, [])\nr").repr(), "[]");
+    assert_eq!(ok("r: list[str] = list(map(shout, []))\nr").repr(), "[]");
     assert_eq!(ok("f = hypot\nf(6, 8)"), Value::F64(10.0));
     assert_eq!(ok("hypot").repr(), "<native function hypot>");
+}
+
+#[test]
+fn options_map_to_optional() {
+    let mut i = Interpreter::new();
+    i.register_fn("find", |xs: Vec<i64>, x: i64| {
+        xs.iter().position(|&y| y == x).map(|p| p as i64)
+    });
+    i.register_fn("or_zero", |x: Option<u8>| x.unwrap_or(0));
+    assert_eq!(i.eval("find([5, 6], 6)").unwrap(), Value::I64(1));
+    assert_eq!(i.eval("find([5, 6], 7)").unwrap(), Value::None);
+    assert_eq!(i.eval("or_zero(None)").unwrap(), Value::U8(0));
+    assert_eq!(i.eval("or_zero(9)").unwrap(), Value::U8(9));
+    assert!(i.eval("or_zero('x')").is_err());
 }

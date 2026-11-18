@@ -1,12 +1,13 @@
 // LR(1) grammar for femtopython. Tokens (including INDENT/DEDENT) come from
 // the hand-written lexer in lexer.rs.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::*;
+use crate::check::{free_vars_of_def, free_vars_of_lambda};
 use crate::error::Error;
 use crate::lexer::Tok;
-use crate::types::Type;
+use crate::types::{Type, TypeArg};
 
 use super::{mk, user_err};
 
@@ -23,8 +24,8 @@ extern {
         "name" => Tok::Name(<String>),
         "int" => Tok::Int(<u64>),
         "float" => Tok::Float(<f64>),
-        "str" => Tok::Str(<Rc<str>>),
-        "bytes" => Tok::Bytes(<Rc<[u8]>>),
+        "str" => Tok::Str(<Arc<str>>),
+        "bytes" => Tok::Bytes(<Arc<[u8]>>),
         "def" => Tok::Def,
         "return" => Tok::Return,
         "lambda" => Tok::Lambda,
@@ -35,6 +36,15 @@ extern {
         "False" => Tok::False,
         "None" => Tok::None,
         "pass" => Tok::Pass,
+        "if" => Tok::If,
+        "elif" => Tok::Elif,
+        "else" => Tok::Else,
+        "while" => Tok::While,
+        "for" => Tok::For,
+        "in" => Tok::In,
+        "is" => Tok::Is,
+        "break" => Tok::Break,
+        "continue" => Tok::Continue,
         "(" => Tok::LParen,
         ")" => Tok::RParen,
         "[" => Tok::LBracket,
@@ -49,6 +59,8 @@ extern {
         "-" => Tok::Minus,
         "*" => Tok::Star,
         "/" => Tok::Slash,
+        "//" => Tok::SlashSlash,
+        "**" => Tok::StarStar,
         "%" => Tok::Percent,
         "&" => Tok::Amp,
         "|" => Tok::Pipe,
@@ -66,7 +78,15 @@ extern {
         "+=" => Tok::PlusEq,
         "-=" => Tok::MinusEq,
         "*=" => Tok::StarEq,
+        "/=" => Tok::SlashEq,
+        "//=" => Tok::SlashSlashEq,
+        "**=" => Tok::StarStarEq,
         "%=" => Tok::PercentEq,
+        "&=" => Tok::AmpEq,
+        "|=" => Tok::PipeEq,
+        "^=" => Tok::CaretEq,
+        "<<=" => Tok::ShlEq,
+        ">>=" => Tok::ShrEq,
     }
 }
 
@@ -96,16 +116,43 @@ pub SingleExpr: Expr = <Expr> "NEWLINE";
 Stmt: Stmt = {
     <SimpleStmt> "NEWLINE",
     FuncDef,
+    IfStmt,
+    WhileStmt,
+    ForStmt,
 };
 
 FuncDef: Stmt = {
-    <l:@L> "def" <name:"name"> "(" <params:Comma<Param>> ")" <ret:("->" <Type>)?> ":"
-        <body:Suite> <r:@R> =>
-        Stmt { kind: StmtKind::Def(Rc::new(FuncDef { name, params, ret, body })), span: (l, r) },
+    <l:@L> "def" <name:"name"> "(" <params:Comma<Param>> ")" <ret:("->" <PlainType>)?> ":"
+        <body:Suite> <r:@R> => {
+        let free = free_vars_of_def(&params, &body);
+        Stmt {
+            kind: StmtKind::Def(Arc::new(FuncDef { name, params, ret, body, free })),
+            span: (l, r),
+        }
+    },
 };
 
 Param: Param = {
-    <l:@L> <name:"name"> <ty:(":" <Type>)?> <r:@R> => Param { name, ty, span: (l, r) },
+    <l:@L> <name:"name"> <ty:(":" <PlainType>)?> <r:@R> => Param { name, ty, span: (l, r) },
+};
+
+IfStmt: Stmt = {
+    <l:@L> "if" <cond:Expr> ":" <body:Suite> <elifs:("elif" <Expr> ":" <Suite>)*>
+        <orelse:("else" ":" <Suite>)?> <r:@R> => {
+        let mut branches = vec![(cond, body)];
+        branches.extend(elifs);
+        Stmt { kind: StmtKind::If { branches, orelse }, span: (l, r) }
+    },
+};
+
+WhileStmt: Stmt = {
+    <l:@L> "while" <cond:Expr> ":" <body:Suite> <r:@R> =>
+        Stmt { kind: StmtKind::While { cond, body }, span: (l, r) },
+};
+
+ForStmt: Stmt = {
+    <l:@L> "for" <targets:Comma1<"name">> "in" <iter:Expr> ":" <body:Suite> <r:@R> =>
+        Stmt { kind: StmtKind::For { targets, iter, body }, span: (l, r) },
 };
 
 Suite: Vec<Stmt> = {
@@ -134,22 +181,49 @@ SimpleStmt: Stmt = {
     },
     <l:@L> "return" <e:Expr?> <r:@R> => Stmt { kind: StmtKind::Return(e), span: (l, r) },
     <l:@L> "pass" <r:@R> => Stmt { kind: StmtKind::Pass, span: (l, r) },
+    <l:@L> "break" <r:@R> => Stmt { kind: StmtKind::Break, span: (l, r) },
+    <l:@L> "continue" <r:@R> => Stmt { kind: StmtKind::Continue, span: (l, r) },
 };
 
 AugOp: BinOp = {
     "+=" => BinOp::Add,
     "-=" => BinOp::Sub,
     "*=" => BinOp::Mul,
+    "/=" => BinOp::Div,
+    "//=" => BinOp::FloorDiv,
+    "**=" => BinOp::Pow,
     "%=" => BinOp::Mod,
+    "&=" => BinOp::BitAnd,
+    "|=" => BinOp::BitOr,
+    "^=" => BinOp::BitXor,
+    "<<=" => BinOp::Shl,
+    ">>=" => BinOp::Shr,
 };
 
 // ------------------------------------------------------------------ types
 
+/// Any annotation, including `rwlock[T]` & co. (declarations only).
 Type: Type = {
     <l:@L> <n:"name"> <r:@R> =>? Type::from_name(&n, vec![]).map_err(|m| user_err(m, (l, r))),
-    <l:@L> <n:"name"> "[" <args:Comma<Type>> "]" <r:@R> =>?
+    <l:@L> <n:"name"> "[" <args:Comma<TypeArg>> "]" <r:@R> =>?
         Type::from_name(&n, args).map_err(|m| user_err(m, (l, r))),
     "None" => Type::None,
+};
+
+/// An annotation that may not be a lock (parameters and return types).
+PlainType: Type = {
+    <l:@L> <t:Type> <r:@R> =>? match t {
+        Type::Lock(k, _) => Err(user_err(
+            format!("'{}' may only annotate a variable declaration", k.name()),
+            (l, r),
+        )),
+        t => Ok(t),
+    },
+};
+
+TypeArg: TypeArg = {
+    Type => TypeArg::One(<>),
+    "[" <Comma<Type>> "]" => TypeArg::Many(<>),
 };
 
 // ------------------------------------------------------------ expressions
@@ -158,8 +232,16 @@ Type: Type = {
 // (`a < b < c` is a syntax error, as in Rust).
 
 Expr: Expr = {
-    <l:@L> "lambda" <params:Comma<"name">> ":" <body:Expr> <r:@R> =>?
-        mk(ExprKind::Lambda(Rc::new(LambdaDef { params, body })), l, r),
+    <l:@L> "lambda" <params:Comma<"name">> ":" <body:Expr> <r:@R> =>? {
+        let free = free_vars_of_lambda(&params, &body);
+        mk(ExprKind::Lambda(Arc::new(LambdaDef { params, body, free })), l, r)
+    },
+    <l:@L> <body:OrExpr> "if" <cond:OrExpr> "else" <orelse:Expr> <r:@R> =>?
+        mk(ExprKind::IfExp {
+            body: Box::new(body),
+            cond: Box::new(cond),
+            orelse: Box::new(orelse),
+        }, l, r),
     OrExpr,
 };
 
@@ -183,6 +265,9 @@ NotExpr: Expr = {
 Comparison: Expr = {
     <l:@L> <a:BitOr> <op:CmpOp> <b:BitOr> <r:@R> =>?
         mk(ExprKind::Compare(op, Box::new(a), Box::new(b)), l, r),
+    <l:@L> <a:BitOr> "is" "None" <r:@R> =>? mk(ExprKind::IsNone(Box::new(a), false), l, r),
+    <l:@L> <a:BitOr> "is" "not" "None" <r:@R> =>?
+        mk(ExprKind::IsNone(Box::new(a), true), l, r),
     BitOr,
 };
 
@@ -193,6 +278,8 @@ CmpOp: CmpOp = {
     "!=" => CmpOp::Ne,
     ">=" => CmpOp::Ge,
     ">" => CmpOp::Gt,
+    "in" => CmpOp::In,
+    "not" "in" => CmpOp::NotIn,
 };
 
 Tier<Op, Next>: Expr = {
@@ -213,14 +300,27 @@ BitXorOp: BinOp = "^" => BinOp::BitXor;
 BitAndOp: BinOp = "&" => BinOp::BitAnd;
 ShiftOp: BinOp = { "<<" => BinOp::Shl, ">>" => BinOp::Shr };
 ArithOp: BinOp = { "+" => BinOp::Add, "-" => BinOp::Sub };
-TermOp: BinOp = { "*" => BinOp::Mul, "/" => BinOp::Div, "%" => BinOp::Mod };
+TermOp: BinOp = {
+    "*" => BinOp::Mul,
+    "/" => BinOp::Div,
+    "//" => BinOp::FloorDiv,
+    "%" => BinOp::Mod,
+};
 
 Factor: Expr = {
     <l:@L> <op:UnaryOp> <e:Factor> <r:@R> =>? mk(ExprKind::Unary(op, Box::new(e)), l, r),
-    Primary,
+    Power,
 };
 
 UnaryOp: UnOp = { "-" => UnOp::Neg, "+" => UnOp::Pos, "~" => UnOp::Invert };
+
+// `**` binds tighter than unary minus on its left and is right-associative,
+// as in Python: -2 ** 2 == -4, 2 ** 3 ** 2 == 512.
+Power: Expr = {
+    <l:@L> <a:Primary> "**" <b:Factor> <r:@R> =>?
+        mk(ExprKind::Binary(BinOp::Pow, Box::new(a), Box::new(b)), l, r),
+    Primary,
+};
 
 Primary: Expr = {
     <l:@L> <f:Primary> "(" <args:Comma<Expr>> ")" <r:@R> =>?

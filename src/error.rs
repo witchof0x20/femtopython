@@ -25,6 +25,8 @@ pub enum ErrorKind {
     Permission,
     /// A resource limit from the [`Config`](crate::Config) was exceeded.
     Limit,
+    /// The host set the interrupt flag (see `Interpreter::interrupt_handle`).
+    Interrupted,
 }
 
 impl ErrorKind {
@@ -41,6 +43,7 @@ impl ErrorKind {
             ErrorKind::Io => "IOError",
             ErrorKind::Permission => "PermissionError",
             ErrorKind::Limit => "LimitError",
+            ErrorKind::Interrupted => "KeyboardInterrupt",
         }
     }
 }

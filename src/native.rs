@@ -15,6 +15,7 @@
 //! | [`Bytes`]                     | `bytes`                  |
 //! | `PathBuf`                     | `Path`                   |
 //! | `()`                          | `None` (return only)     |
+//! | `Option<T>`                   | `Optional[T]`            |
 //! | `Vec<T>`                      | `list[T]`                |
 //! | `HashMap<K, V>`               | `dict[K, V]`             |
 //! | `(A, B)` .. `(A, B, C, D)`    | `tuple[A, B, ..]`        |
@@ -25,10 +26,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind, Result, err};
-use crate::types::Type;
+use crate::types::{FnSig, Type};
 use crate::value::Value;
 
 /// A Rust type that can be received from a script.
@@ -156,7 +157,28 @@ impl IntoValue for PathBuf {
         Type::Path
     }
     fn into_value(self) -> Result<Value> {
-        Ok(Value::Path(Rc::new(self)))
+        Ok(Value::Path(Arc::new(self)))
+    }
+}
+
+impl<T: FromValue> FromValue for Option<T> {
+    fn ty() -> Type {
+        Type::optional(T::ty())
+    }
+    fn from_value(v: Value) -> Result<Self> {
+        match v {
+            Value::None => Ok(None),
+            v => T::from_value(v).map(Some),
+        }
+    }
+}
+
+impl<T: IntoValue> IntoValue for Option<T> {
+    fn ty() -> Type {
+        Type::optional(T::ty())
+    }
+    fn into_value(self) -> Result<Value> {
+        self.map_or(Ok(Value::None), T::into_value)
     }
 }
 
@@ -287,7 +309,7 @@ impl<T: IntoValue, E: IntoScriptError> IntoValue for std::result::Result<T, E> {
     }
 }
 
-type RawFn = dyn Fn(Vec<Value>) -> Result<Value>;
+type RawFn = dyn Fn(Vec<Value>) -> Result<Value> + Send + Sync;
 
 /// A host function callable from scripts.
 pub struct NativeFn {
@@ -308,7 +330,7 @@ impl NativeFn {
     /// An unchecked function receiving the raw argument values.
     pub fn raw(
         name: impl Into<String>,
-        func: impl Fn(&[Value]) -> Result<Value> + 'static,
+        func: impl Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
     ) -> NativeFn {
         NativeFn {
             name: name.into(),
@@ -324,6 +346,16 @@ impl NativeFn {
 
     pub fn ret(&self) -> &Type {
         &self.ret
+    }
+
+    /// `Callable[[A, ...], R]`, or bare `Callable` for raw functions.
+    pub fn signature(&self) -> Type {
+        Type::Function(self.params.as_ref().map(|params| {
+            Box::new(FnSig {
+                params: params.clone(),
+                ret: self.ret.clone(),
+            })
+        }))
     }
 
     pub(crate) fn call(&self, args: Vec<Value>) -> Result<Value> {
@@ -363,7 +395,7 @@ macro_rules! native_arity {
     ($($t:ident $v:ident),*) => {
         impl<F, R, $($t),*> IntoNativeFn<(R, $($t,)*)> for F
         where
-            F: Fn($($t),*) -> R + 'static,
+            F: Fn($($t),*) -> R + Send + Sync + 'static,
             R: IntoValue,
             $($t: FromValue,)*
         {

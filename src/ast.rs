@@ -2,15 +2,16 @@
 //!
 //! Expressions are depth-limited at construction ([`Expr::new`]), so the
 //! parser can never hand the evaluator (or `Drop`) a tree deep enough to
-//! overflow the native stack.
+//! overflow the native stack. Statement nesting is bounded by the lexer's
+//! indentation limit.
 
-use std::rc::Rc;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::error::{Error, Span, err};
 use crate::types::Type;
 
-/// Maximum nesting depth of a single expression. Matches CPython's parser
-/// limit on nested parentheses in spirit.
+/// Maximum nesting depth of a single expression.
 pub const MAX_EXPR_DEPTH: u32 = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +20,9 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    FloorDiv,
     Mod,
+    Pow,
     BitAnd,
     BitOr,
     BitXor,
@@ -34,7 +37,9 @@ impl BinOp {
             BinOp::Sub => "-",
             BinOp::Mul => "*",
             BinOp::Div => "/",
+            BinOp::FloorDiv => "//",
             BinOp::Mod => "%",
+            BinOp::Pow => "**",
             BinOp::BitAnd => "&",
             BinOp::BitOr => "|",
             BinOp::BitXor => "^",
@@ -52,6 +57,8 @@ pub enum CmpOp {
     Ne,
     Ge,
     Gt,
+    In,
+    NotIn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,11 +85,11 @@ pub struct Expr {
 #[derive(Debug)]
 pub enum ExprKind {
     /// Unsigned magnitude; the sign comes from an enclosing `Neg`, and the
-    /// concrete integer type from context (see `Interpreter::eval_hinted`).
+    /// concrete numeric type from context.
     Int(u64),
     Float(f64),
-    Str(Rc<str>),
-    Bytes(Rc<[u8]>),
+    Str(Arc<str>),
+    Bytes(Arc<[u8]>),
     Bool(bool),
     None,
     Name(String),
@@ -93,17 +100,43 @@ pub enum ExprKind {
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Compare(CmpOp, Box<Expr>, Box<Expr>),
+    /// `x is None` (`false`) / `x is not None` (`true`). `is` only exists
+    /// for `None` checks, so the grammar only accepts a literal `None` on
+    /// the right.
+    IsNone(Box<Expr>, bool),
     Logic(LogicOp, Box<Expr>, Box<Expr>),
+    /// `body if cond else orelse`
+    IfExp {
+        body: Box<Expr>,
+        cond: Box<Expr>,
+        orelse: Box<Expr>,
+    },
     Call(Box<Expr>, Vec<Expr>),
     Index(Box<Expr>, Box<Expr>),
     Attr(Box<Expr>, String),
-    Lambda(Rc<LambdaDef>),
+    Lambda(Arc<LambdaDef>),
+}
+
+/// Names a function body uses from enclosing scopes, split by how they are
+/// used, so captures (and lock permissions) can be decided when the `def`
+/// or `lambda` executes.
+#[derive(Debug, Default, Clone)]
+pub struct FreeVars {
+    pub reads: BTreeSet<String>,
+    pub writes: BTreeSet<String>,
+}
+
+impl FreeVars {
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.reads.union(&self.writes)
+    }
 }
 
 #[derive(Debug)]
 pub struct LambdaDef {
     pub params: Vec<String>,
     pub body: Expr,
+    pub free: FreeVars,
 }
 
 impl Expr {
@@ -135,7 +168,7 @@ impl Expr {
 }
 
 impl ExprKind {
-    fn for_each_child(&self, mut f: impl FnMut(&Expr)) {
+    pub fn for_each_child<'a>(&'a self, mut f: impl FnMut(&'a Expr)) {
         match self {
             ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -149,13 +182,18 @@ impl ExprKind {
                 f(k);
                 f(v)
             }),
-            ExprKind::Unary(_, e) | ExprKind::Attr(e, _) => f(e),
+            ExprKind::Unary(_, e) | ExprKind::Attr(e, _) | ExprKind::IsNone(e, _) => f(e),
             ExprKind::Binary(_, a, b)
             | ExprKind::Compare(_, a, b)
             | ExprKind::Logic(_, a, b)
             | ExprKind::Index(a, b) => {
                 f(a);
                 f(b)
+            }
+            ExprKind::IfExp { body, cond, orelse } => {
+                f(body);
+                f(cond);
+                f(orelse)
             }
             ExprKind::Call(callee, args) => {
                 f(callee);
@@ -179,6 +217,7 @@ pub struct FuncDef {
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: Vec<Stmt>,
+    pub free: FreeVars,
 }
 
 #[derive(Debug)]
@@ -190,20 +229,20 @@ pub struct Stmt {
 #[derive(Debug)]
 pub enum StmtKind {
     Expr(Expr),
-    /// `name = value` or `name: ty = value`. A (re)declaration, never a
-    /// mutation.
+    /// `name = value` (`ty` is `None`) or `name: ty = value`. See
+    /// `Interpreter::declare` for when an unannotated one is a write.
     Declare {
         name: String,
         ty: Option<Type>,
         value: Expr,
     },
-    /// `target[index]... = value`. `target` is always an `Index` chain rooted
-    /// at a `Name` (enforced by the parser).
+    /// `target[index]... = value`; `target` is an `Index` chain rooted at a
+    /// `Name` (enforced by the parser).
     Assign {
         target: Expr,
         value: Expr,
     },
-    /// `target op= value`. `target` is a `Name` or an `Index` chain.
+    /// `target op= value`; `target` is a `Name` or an `Index` chain.
     AugAssign {
         target: Expr,
         op: BinOp,
@@ -211,7 +250,24 @@ pub enum StmtKind {
     },
     Return(Option<Expr>),
     Pass,
-    Def(Rc<FuncDef>),
+    Break,
+    Continue,
+    Def(Arc<FuncDef>),
+    If {
+        /// `if` followed by any `elif`s.
+        branches: Vec<(Expr, Vec<Stmt>)>,
+        orelse: Option<Vec<Stmt>>,
+    },
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+    },
+    For {
+        /// One name, or several for tuple unpacking (`for k, v in ...`).
+        targets: Vec<String>,
+        iter: Expr,
+        body: Vec<Stmt>,
+    },
 }
 
 /// For an assignment target, the root variable name and the chain of index
@@ -227,4 +283,14 @@ pub fn target_path(e: &Expr) -> Option<(&str, Vec<&Expr>)> {
         }
         _ => None,
     }
+}
+
+/// Methods that mutate their receiver in place without revealing its
+/// contents. A receiver used with these counts as written, not read.
+pub const WRITE_METHODS: &[&str] = &["append", "extend", "add", "discard", "clear"];
+/// Methods that mutate their receiver and reveal something about it.
+pub const READ_WRITE_METHODS: &[&str] = &["pop", "remove"];
+
+pub fn is_mutating_method(name: &str) -> bool {
+    WRITE_METHODS.contains(&name) || READ_WRITE_METHODS.contains(&name)
 }

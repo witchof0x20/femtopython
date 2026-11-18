@@ -23,12 +23,21 @@ pub(crate) fn user_err(msg: impl Into<String>, span: Span) -> PErr {
     }
 }
 
-fn convert(e: PErr) -> Error {
+fn convert(e: PErr, src_len: usize) -> Error {
     match e {
         ParseError::User { error } => error,
         ParseError::UnrecognizedEof { location, .. } => {
             Error::new(ErrorKind::IncompleteInput, "unexpected end of input")
                 .at((location, location))
+        }
+        // The lexer closes open blocks with zero-width DEDENT tokens at the
+        // end of input; tripping over one means a block body is missing
+        // (more input needed), not that the input is wrong.
+        ParseError::UnrecognizedToken {
+            token: (l, Tok::Dedent, r),
+            ..
+        } if l == r && r == src_len => {
+            Error::new(ErrorKind::IncompleteInput, "unexpected end of input").at((l, l))
         }
         ParseError::UnrecognizedToken {
             token: (l, tok, r),
@@ -56,11 +65,11 @@ fn tokens(src: &str) -> Result<impl Iterator<Item = Result<(usize, Tok, usize), 
 pub fn parse_program(src: &str) -> Result<Vec<Stmt>> {
     grammar::ProgramParser::new()
         .parse(tokens(src)?)
-        .map_err(convert)
+        .map_err(|e| convert(e, src.len()))
 }
 
 pub fn parse_expr(src: &str) -> Result<Expr> {
     grammar::SingleExprParser::new()
         .parse(tokens(src)?)
-        .map_err(convert)
+        .map_err(|e| convert(e, src.len()))
 }
